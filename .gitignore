@@ -1,0 +1,38 @@
+# dependencies
+node_modules/
+.pnp
+.pnp.*
+
+# next.js
+.next/
+out/
+build/
+next-env.d.ts
+
+# production
+dist/
+
+# env files (never commit real keys)
+.env
+.env*.local
+!.env.example
+
+# local JSON store, used when DATABASE_URL is unset
+.data/
+
+# typescript
+*.tsbuildinfo
+
+# testing
+coverage/
+
+# misc
+.DS_Store
+*.pem
+.vercel/
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.yarn/

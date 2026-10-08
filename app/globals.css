@@ -1,0 +1,701 @@
+@import "tailwindcss";
+
+/* Short viewports, such as a phone in landscape. */
+@custom-variant short (@media (max-height: 520px));
+
+/**
+ * `accent` marks what can be acted on: buttons, links, a selected date, a focused field. `good` marks only the cheapest
+ * option and savings. `warn` marks what the traveller must not miss, such as a long layover or an airport change.
+ *
+ * Contrast on white (and on sky-deep #c2d9fb, the darkest background text sits on):
+ *   ink          17.4:1  (12.1)
+ *   ink-soft     10.3:1  (7.2)
+ *   ink-muted     7.3:1  (5.1)   minimum for body-size text
+ *   ink-faint     2.3:1          decoration and disabled states only, not for text
+ *   accent        5.9:1  (4.1)   on sky only as a mark or large text; white on accent is 5.9:1
+ *   good          5.4:1          4.8:1 on its own tint; not for use on sky
+ *   warn          6.0:1          5.5:1 on its own tint; not for use on sky
+ */
+@theme {
+  --color-ground: #f5f8fc;
+  --color-paper: #ffffff;
+  --color-soft: #eef2f7;
+  --color-soft-strong: #e3e9f1;
+  --color-ink: #0e1a2e;
+  --color-ink-soft: #344155;
+  --color-ink-muted: #4d576a;
+  --color-ink-faint: #a3abba;
+  --color-rule: #e3e8f0;
+  --color-rule-strong: #cdd6e2;
+  --color-accent: #1a5ae0;
+  --color-accent-hover: #164fc7;
+  --color-accent-soft: #eaf1fe;
+  --color-accent-ink: #1446b0;
+  --color-sky: #d4e5fc;
+  --color-sky-deep: #c2d9fb;
+  --color-good: #0b7a44;
+  --color-good-soft: #e7f5ee;
+  --color-warn: #955200;
+  --color-warn-soft: #fdf3e5;
+  --color-well: #f7f9fc;
+
+  /* Shadows use the ink colour, rgb(14 26 46). */
+  --shadow-xs: 0 1px 2px rgb(14 26 46 / 0.06);
+  --shadow-sm: 0 1px 2px rgb(14 26 46 / 0.05), 0 3px 10px -3px rgb(14 26 46 / 0.08);
+  --shadow-md: 0 1px 3px rgb(14 26 46 / 0.05), 0 12px 32px -12px rgb(14 26 46 / 0.18);
+  --shadow-lg: 0 2px 6px rgb(14 26 46 / 0.06), 0 28px 70px -20px rgb(14 26 46 / 0.32);
+
+  /* Loaded in app/layout.tsx. Nunito for body text, Comfortaa for titles (`.display`). */
+  --font-sans: var(--font-nunito), ui-rounded, ui-sans-serif, system-ui, sans-serif;
+  --font-display: var(--font-comfortaa), var(--font-nunito), ui-rounded, ui-sans-serif, sans-serif;
+
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-spring: cubic-bezier(0.34, 1.3, 0.64, 1);
+}
+
+:root {
+  color-scheme: light;
+}
+
+html {
+  background: var(--color-ground);
+  -webkit-tap-highlight-color: transparent;
+  transition: background-color 0.2s ease-in;
+}
+
+/*
+ * Reserve the scrollbar's space on every page except the landing's first screen (`data-landing`, which doesn't scroll), so content
+ * doesn't shift when a page starts scrolling or an overlay locks it. An empty gutter shows html's background, so html takes the
+ * scrim's shade while one is open to avoid a pale stripe.
+ */
+html:not(:has([data-landing])) {
+  scrollbar-gutter: stable;
+}
+/* The landing pads its header and corners by the scrollbar width so they line up with other pages. `--landing-gutter` is measured
+   before first paint (conversation.tsx) and unset where scrollbars overlay the page. */
+html:has([data-landing]) header {
+  padding-right: var(--landing-gutter, 0px);
+}
+html:has(.scrim[data-state="open"]) {
+  background-color: color-mix(in srgb, var(--color-ground), var(--color-ink) 25%);
+  transition: background-color 0.3s var(--ease-out);
+}
+/* A sheet over a dialog (the date grid's flights) stacks two 25% scrims, so 43.75%. useOverlay sets `data-stacked` (overlay.tsx). */
+html[data-stacked]:has(.scrim[data-state="open"]) {
+  background-color: color-mix(in srgb, var(--color-ground), var(--color-ink) 43.75%);
+}
+
+/* No overscroll bounce on the home page, so a pull doesn't drag the header or the page. */
+html[data-still],
+html[data-still] body {
+  overscroll-behavior: none;
+}
+
+/* Pages with a cloud band: no vertical bounce, so a pull doesn't show a bare strip above the sky. Swipe-back still works. */
+html:has(.cloud-band),
+html:has(.cloud-band) body {
+  overscroll-behavior-y: none;
+}
+
+body {
+  background: var(--color-ground);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+@layer components {
+  /* Tabular figures for computed numbers (prices, times, counts) so they line up in columns. */
+  .nums {
+    font-variant-numeric: tabular-nums;
+  }
+  /* Titles. Comfortaa is wide, so the tracking is slightly tighter. */
+  .display {
+    font-family: var(--font-display);
+    letter-spacing: -0.02em;
+  }
+  /* Model-written text: the write-up, card lines, answers. */
+  .words {
+    font-family: var(--font-sans);
+    letter-spacing: 0;
+  }
+}
+
+/* Comfortaa's 600 looks lighter than Nunito's, so semibold titles use 700. A utility, so it outranks `font-semibold`. */
+@layer utilities {
+  .display.font-semibold {
+    font-weight: 700;
+  }
+}
+
+/* Keyboard focus ring. In the base layer so controls with their own focus style (like `.field`) can turn it off with a utility. */
+@layer base {
+  :where(a, button, input, select, textarea, [tabindex]):focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
+  :where(button, [role="button"]):not(:disabled) {
+    cursor: pointer;
+  }
+}
+
+::selection {
+  background: var(--color-accent-soft);
+}
+
+/* ------------------------------------------------------------------ Motion */
+
+/* Entrances rise with an ease-out, or scale up with a slight overshoot when popping from a control. Exits are faster. */
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.rise {
+  animation: rise 0.5s var(--ease-out) backwards;
+}
+
+@keyframes fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+.fade {
+  animation: fade 0.35s var(--ease-out) backwards;
+}
+/* A separate name because reusing `fade` for the closed state would not restart the animation, so it would snap to its end. */
+@keyframes fade-out {
+  to {
+    opacity: 0;
+  }
+}
+
+@keyframes pop {
+  from {
+    opacity: 0;
+    transform: translateY(-6px) scale(0.965);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes pop-out {
+  to {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.98);
+  }
+}
+.pop {
+  animation: pop 0.24s var(--ease-spring) backwards;
+}
+.pop[data-state="closed"] {
+  animation: pop-out 0.14s ease-in forwards;
+}
+
+@keyframes sheet-right {
+  from {
+    transform: translateX(104%);
+  }
+  to {
+    transform: none;
+  }
+}
+@keyframes sheet-right-out {
+  to {
+    transform: translateX(104%);
+  }
+}
+@keyframes sheet-up {
+  from {
+    transform: translateY(100%);
+  }
+  to {
+    transform: none;
+  }
+}
+@keyframes sheet-up-out {
+  to {
+    transform: translateY(100%);
+  }
+}
+.sheet {
+  animation: sheet-up 0.42s var(--ease-out) backwards;
+}
+.sheet[data-state="closed"] {
+  animation: sheet-up-out 0.22s ease-in forwards;
+}
+@media (min-width: 768px) {
+  .sheet {
+    animation-name: sheet-right;
+  }
+  .sheet[data-state="closed"] {
+    animation-name: sheet-right-out;
+  }
+}
+
+.scrim {
+  animation: fade 0.3s var(--ease-out) backwards;
+}
+.scrim[data-state="closed"] {
+  animation: fade-out 0.2s ease-in forwards;
+}
+
+@keyframes modal-in {
+  from {
+    opacity: 0;
+    transform: translateY(14px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.modal {
+  animation: modal-in 0.34s var(--ease-out) backwards;
+}
+.modal[data-state="closed"] {
+  animation: fade-out 0.16s ease-in forwards;
+}
+/* On phones, dialogs (including the date grid's panel) animate as bottom sheets. */
+@media (max-width: 639px) {
+  .modal {
+    animation: sheet-up 0.42s var(--ease-out) backwards;
+  }
+  .modal[data-state="closed"] {
+    animation: sheet-up-out 0.22s ease-in forwards;
+  }
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.spin {
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes breathe {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+.breathe {
+  animation: breathe 1.6s ease-in-out infinite;
+}
+
+/* Loading placeholders. */
+@keyframes shimmer {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}
+.shimmer {
+  background: linear-gradient(90deg, var(--color-soft) 0%, var(--color-soft-strong) 40%, var(--color-soft) 80%);
+  background-size: 200% 100%;
+  animation: shimmer 1.6s linear infinite;
+}
+
+/* Streak along the route line while a search runs (components/search/edit-search.tsx). A third of the track long, clipped to it. */
+@keyframes sweep-way {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(300%);
+  }
+}
+.sweep-way {
+  animation: sweep-way 1.5s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+/* Sheen across a busy button (components/search/progress.tsx). */
+@keyframes sweep {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(260%);
+  }
+}
+.sweep {
+  animation: sweep 1.5s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+@keyframes step-in {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.step-in {
+  animation: step-in 0.45s var(--ease-out) backwards;
+}
+
+/* The landing's title, box and trips rise in one after another. */
+@keyframes intro {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.intro {
+  animation: intro 0.8s cubic-bezier(0.16, 1, 0.3, 1) backwards;
+}
+
+/* Chat-style motion: answers pop up from the bottom right, questions arrive from the bottom left, with a typing bubble between. */
+@keyframes bubble-in {
+  from {
+    opacity: 0;
+    transform: translateY(14px) scale(0.86);
+  }
+  55% {
+    opacity: 1;
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.bubble-in {
+  transform-origin: 100% 100%;
+  animation: bubble-in 0.48s cubic-bezier(0.34, 1.45, 0.64, 1) backwards;
+}
+@keyframes msg-in {
+  from {
+    opacity: 0;
+    transform: translateY(12px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.msg-in {
+  transform-origin: 0 100%;
+  animation: msg-in 0.5s cubic-bezier(0.16, 1, 0.3, 1) backwards;
+}
+@keyframes typing {
+  0%,
+  60%,
+  100% {
+    transform: none;
+    opacity: 0.4;
+  }
+  30% {
+    transform: translateY(-3px);
+    opacity: 1;
+  }
+}
+.typing > span {
+  animation: typing 1.2s ease-in-out infinite;
+}
+.typing > span:nth-child(2) {
+  animation-delay: 0.15s;
+}
+.typing > span:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+/* Collapsible panel that animates to its content's height. */
+.grow {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 0.34s var(--ease-out);
+}
+.grow[data-open="true"] {
+  grid-template-rows: 1fr;
+}
+.grow > * {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.press {
+  transition:
+    transform 0.16s var(--ease-out),
+    background-color 0.18s ease,
+    box-shadow 0.22s ease,
+    color 0.18s ease,
+    border-color 0.18s ease;
+}
+.press:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+/* Surfaces, in the components layer so utilities on the same element win. Each element sets its own `rounded-*`. */
+@layer components {
+  /* Primary action: solid accent with a faint light edge along the top. */
+  .btn-primary {
+    background: var(--color-accent);
+    color: #fff;
+    box-shadow:
+      inset 0 1px 0 rgb(255 255 255 / 0.16),
+      0 1px 2px rgb(14 26 46 / 0.14);
+  }
+  .btn-primary:hover:not(:disabled) {
+    background: var(--color-accent-hover);
+  }
+  .btn-primary:disabled {
+    opacity: 0.55;
+  }
+
+  /* Pressable controls over the page or sky: header controls, the island, chips, secondary buttons, the corners. */
+  .float {
+    position: relative;
+    background-color: var(--color-paper);
+    box-shadow:
+      0 0 0 1px var(--color-rule),
+      var(--shadow-xs);
+  }
+  /* A hovered child matches through `:where`, so `.field` focus and `.lifted` below outrank it. Disabled children don't count. */
+  :is(a, button).float:hover:not(:disabled),
+  .float:where(:has(> a:hover), :has(> button:hover:not(:disabled))) {
+    box-shadow:
+      0 0 0 1px var(--color-rule-strong),
+      0 2px 6px -1px rgb(14 26 46 / 0.1);
+  }
+  /* Text fields: blue edge and a pale halo while focused. */
+  .field {
+    transition: box-shadow 0.18s ease;
+  }
+  .field:focus-within {
+    box-shadow:
+      0 0 0 1.5px var(--color-accent),
+      0 0 0 5px rgb(26 90 224 / 0.12),
+      var(--shadow-xs);
+  }
+  /* The landing's search box gets a deeper shadow. */
+  .float.lifted {
+    box-shadow:
+      0 0 0 1px var(--color-rule),
+      var(--shadow-md);
+  }
+  .field.lifted:focus-within {
+    box-shadow:
+      0 0 0 1.5px var(--color-accent),
+      0 0 0 5px rgb(26 90 224 / 0.12),
+      var(--shadow-md);
+  }
+  /* Reading surfaces: answers, groups of choices, lists of places or trips. */
+  .slip {
+    background-color: var(--color-paper);
+    box-shadow:
+      0 0 0 1px var(--color-rule),
+      var(--shadow-xs);
+  }
+
+  /*
+   * Boarding-pass card (components/results/plan-card.tsx). The notches at each end of the tear line are cut with a mask, which
+   * also clips the element's own shadow, so the edge and shadow are drop shadows on the parent `.ticket`. The stub sits below
+   * the pass (80px tall) until the card is 47rem wide, then beside it (200px wide).
+   */
+  .ticket {
+    filter: drop-shadow(0 0 0.5px rgb(14 26 46 / 0.28)) drop-shadow(0 1px 1.5px rgb(14 26 46 / 0.06));
+  }
+  .ticket:hover {
+    filter: drop-shadow(0 0 0.5px rgb(14 26 46 / 0.34)) drop-shadow(0 8px 14px rgb(14 26 46 / 0.1));
+  }
+  .ticket-bites {
+    --bite-a: 0 calc(100% - 80px);
+    --bite-b: 100% calc(100% - 80px);
+    -webkit-mask:
+      radial-gradient(circle 7px at var(--bite-a), #0000 6.5px, #000 7px),
+      radial-gradient(circle 7px at var(--bite-b), #0000 6.5px, #000 7px);
+    -webkit-mask-composite: source-in;
+    mask-composite: intersect;
+  }
+  @container card (width >= 47rem) {
+    .ticket-bites {
+      --bite-a: calc(100% - 200px) 0;
+      --bite-b: calc(100% - 200px) 100%;
+    }
+  }
+
+  /* Sky band at the top of inner pages (components/site/cloud-band.tsx). Fades into the page so no edge shows below the clouds. */
+  .cloud-band {
+    background: linear-gradient(180deg, var(--color-sky-deep) 0%, var(--color-sky) 62%);
+  }
+  .cloud-band::after {
+    content: "";
+    position: absolute;
+    inset: auto 0 0;
+    height: 56px;
+    background: linear-gradient(180deg, rgb(245 248 252 / 0), var(--color-ground));
+  }
+}
+
+/* Wordmark (components/site/logo.tsx). The full stop is drawn as a blue dot. */
+.wordmark {
+  font-family: var(--font-sans);
+  font-weight: 650;
+  letter-spacing: -0.03em;
+  line-height: 1;
+  color: var(--color-ink);
+  white-space: nowrap;
+}
+.wordmark-dot {
+  display: inline-block;
+  width: 0.205em;
+  height: 0.205em;
+  margin: 0 0.06em 0 0.07em;
+  border-radius: 9999px;
+  background: var(--color-accent);
+}
+
+/* Horizontal scrollers without a visible bar. */
+.no-scrollbar {
+  scrollbar-width: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rise,
+  .fade,
+  .pop,
+  .sheet,
+  .scrim,
+  .modal,
+  .breathe,
+  .shimmer,
+  .sweep,
+  .sweep-way,
+  .step-in,
+  .intro,
+  .bubble-in,
+  .msg-in,
+  .typing > span,
+  .spin {
+    animation: none !important;
+  }
+  /* Disable transitions outright. A near-zero duration still starts one and draws a frame at the old values. */
+  *,
+  ::before,
+  ::after {
+    transition: none !important;
+  }
+  /* Hide closing overlays at once, since their exit animation is disabled. */
+  :is(.pop, .sheet, .scrim, .modal)[data-state="closed"] {
+    visibility: hidden;
+  }
+}
+
+/*
+ * Bottom corners: How it works bottom-left (`.to-corner`, how-it-works.tsx) and the source link bottom-right (`.to-source`,
+ * github-button.tsx), clear of a landscape notch. Below 768px the header menu carries both. Each hides where page content
+ * would reach it (`data-composer` from follow-ups.tsx, `data-asking` from conversation.tsx).
+ *
+ * The reCAPTCHA badge also sits bottom-right: above the source link, above the question box when there is one, and in the corner
+ * once the source link hides. On phones it would cover the page, so it is hidden with `visibility` (v3 still mints tokens) and the
+ * required reCAPTCHA attribution is shown in the page instead (conversation.tsx, follow-ups.tsx).
+ */
+.to-source,
+.to-corner {
+  bottom: max(1rem, env(safe-area-inset-bottom));
+}
+/* Aligned with the header controls, 1.25rem inside a 1280px column (header.tsx). */
+.to-corner {
+  left: max(1.25rem, env(safe-area-inset-left), calc((100% - 1280px) / 2 + 1.25rem));
+}
+.to-source {
+  right: max(1.25rem, env(safe-area-inset-right), calc((100% - 1280px) / 2 + 1.25rem));
+}
+html:has([data-landing]) .to-corner {
+  left: max(1.25rem, env(safe-area-inset-left), calc((100% - var(--landing-gutter, 0px) - 1280px) / 2 + 1.25rem));
+}
+html:has([data-landing]) .to-source {
+  right: calc(var(--landing-gutter, 0px) + max(1.25rem, env(safe-area-inset-right), calc((100% - var(--landing-gutter, 0px) - 1280px) / 2 + 1.25rem)));
+}
+.grecaptcha-badge {
+  bottom: calc(max(1rem, env(safe-area-inset-bottom)) + 3.75rem) !important;
+}
+html[data-composer] .grecaptcha-badge {
+  bottom: 6.5rem !important;
+}
+@media (max-width: 1179px) {
+  html[data-composer] .to-source {
+    display: none;
+  }
+  /* How it works stays only while the results rail keeps the question box clear of it. */
+  html[data-composer]:not(:has([data-rail])) .to-corner {
+    display: none;
+  }
+}
+@media (max-width: 1023px) {
+  html[data-composer] .to-corner {
+    display: none;
+  }
+}
+/* The questions pane is 740px wide, so below about 900px it reaches the corner. */
+@media (max-width: 899px) {
+  html[data-asking] .to-source {
+    display: none;
+  }
+  html[data-asking] .grecaptcha-badge {
+    bottom: max(1rem, env(safe-area-inset-bottom)) !important;
+  }
+}
+/* Placed after the rules above so the badge's corner position wins at equal specificity. The data-composer lift still outranks it. */
+@media (max-width: 767px) {
+  .to-source,
+  .to-corner {
+    display: none;
+  }
+  .grecaptcha-badge {
+    bottom: max(1rem, env(safe-area-inset-bottom)) !important;
+  }
+}
+@media (max-width: 639px) {
+  html[data-asking] .grecaptcha-badge,
+  html[data-composer] .grecaptcha-badge {
+    visibility: hidden !important;
+  }
+}
+/*
+ * Print: hide fixed elements (they would repeat over the cards on every page), the space reserved for the question box, the sky
+ * band, and every header item but the logo. Keep each card on one page, and keep the blue of the Book button and the logo dot.
+ */
+@media print {
+  .fixed,
+  .to-source,
+  [data-bar-room],
+  .cloud-band,
+  header > div > :not(:first-child) {
+    display: none !important;
+  }
+  article {
+    break-inside: avoid;
+  }
+  .btn-primary,
+  .wordmark-dot {
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+}
