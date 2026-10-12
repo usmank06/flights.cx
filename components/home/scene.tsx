@@ -61,23 +61,26 @@ export function Scene() {
   const landRef = useRef<HTMLCanvasElement>(null);
   const portRef = useRef<HTMLCanvasElement>(null);
   const skyRef = useRef<HTMLCanvasElement>(null);
+  const stillRef = useRef<HTMLCanvasElement>(null);
   const airRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
     const landCanvas = landRef.current;
     const portCanvas = portRef.current;
     const skyCanvas = skyRef.current;
+    const stillCanvas = stillRef.current;
     const canvas = airRef.current;
     const box = wrap.current;
-    if (!landCanvas || !portCanvas || !skyCanvas || !canvas || !box) return;
+    if (!landCanvas || !portCanvas || !skyCanvas || !stillCanvas || !canvas || !box) return;
     const lc = landCanvas.getContext("2d");
     const pc = portCanvas.getContext("2d");
     const ctx = canvas.getContext("2d");
     if (!lc || !pc || !ctx) return;
     // Three sets of cloud: the banks over the top edge, the deck hanging under them, the banks along the foot.
     const sky = createSkyGL(skyCanvas, [BANKS, DECKS, BANKS]);
-    // Without WebGL, the clouds are drawn once on a 2D context.
-    const still = sky ? null : skyCanvas.getContext("2d");
+    // Without WebGL, the clouds are drawn once on a 2D context. That needs its own canvas, because a canvas that already
+    // returned a WebGL context can't return a 2D one.
+    const still = sky ? null : stillCanvas.getContext("2d");
     const stir = createStir(sky?.splats ?? 0);
     const wake = createWake(stir);
 
@@ -174,8 +177,8 @@ export function Scene() {
     /** Static 2D fallback when WebGL is unavailable. */
     function drawStill() {
       if (!still) return;
-      skyCanvas!.width = Math.round(w * dpr);
-      skyCanvas!.height = Math.round(h * dpr);
+      stillCanvas!.width = Math.round(w * dpr);
+      stillCanvas!.height = Math.round(h * dpr);
       still.setTransform(dpr, 0, 0, dpr, 0, 0);
       still.clearRect(0, 0, w, h);
       sets.forEach((set, s) =>
@@ -692,6 +695,7 @@ export function Scene() {
       <canvas ref={landRef} className="absolute inset-0 h-full w-full opacity-0 transition-opacity duration-1000 data-[ready]:opacity-100" />
       <canvas ref={portRef} className="absolute inset-0 h-full w-full" />
       <canvas ref={skyRef} className="fade absolute inset-0 h-full w-full" />
+      <canvas ref={stillRef} className="fade absolute inset-0 h-full w-full" />
       <canvas ref={airRef} className="absolute inset-0 h-full w-full" />
     </div>
   );

@@ -3,7 +3,7 @@ import type { SearchInput } from "@/lib/flights/types";
 import { AIRPORTS } from "@/lib/airports";
 import { money, shortDate } from "@/lib/format";
 import type { DestinationView, FlightPlan, GridView, PlanView, SearchRequest } from "@/lib/types";
-import { airportsOf, asker, resolveEndpoint, Unanswered, type Endpoint } from "./asking";
+import { airportsOf, asker, resolveEndpoint, SHOPPING_TIMEOUT_MS, Unanswered, type Endpoint } from "./asking";
 import { compactForLLM, daysBetween, describeInput, mapLimit, shiftDay, toSearchInput, type CompactRow, type IndexedItin, type PlannedQuery } from "./core";
 import { abroadOnly, destinationViews } from "./engine";
 import { buildGrid, cleanWindow, gridRoute, heldFares, withHeld } from "./grid";
@@ -67,7 +67,7 @@ export async function runFollowUpQueries(opts: {
   const rows: CompactRow[] = [];
   await mapLimit(calls, 8, async ({ input, i }) => {
     const reason = queries[i].reason;
-    const payload = await asking.must((signal) => backend.shopping(input, { signal, hedgeMs: 2_000, timeoutMs: 8_000, attempts: 2 }), `${describeInput(input)} — ${reason}`);
+    const payload = await asking.must((signal) => backend.shopping(input, { signal, hedgeMs: 2_000, timeoutMs: SHOPPING_TIMEOUT_MS, attempts: 2 }), `${describeInput(input)} — ${reason}`);
     if (!payload) return;
     const rt = input.trip === "round-trip";
     const retDate = rt ? input.flights[1]?.date : undefined;

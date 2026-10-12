@@ -2,8 +2,8 @@ import { BANKS, MAX_SPLATS, type BakedBank } from "./clouds";
 
 /**
  * WebGL cloud renderer, layered between the map and the traffic. scene.tsx supplies positions and the stir; this only draws.
- * `createSkyGL` returns null without WebGL, with software rendering, or without highp fragment floats, and the clouds are then
- * drawn once as a still image.
+ * `createSkyGL` returns null without WebGL, with software rendering, without highp fragment floats, or when the context isn't
+ * real WebGL (some bots and privacy tools fake one). The clouds are then drawn once as a still image. It never throws.
  */
 
 const VERT = `
@@ -136,6 +136,16 @@ function program(gl: WebGLRenderingContext, frag: string) {
 
 /** Creates the cloud renderer on `canvas`. `sets` gives each layer's stir shares; all sets share the same stir. */
 export function createSkyGL(canvas: HTMLCanvasElement, sets: Layer[][] = [BANKS]): SkyGL | null {
+  try {
+    return create(canvas, sets);
+  } catch (e) {
+    // This runs on the page's first render, so a throw would break the whole page.
+    console.warn("sky:", e);
+    return null;
+  }
+}
+
+function create(canvas: HTMLCanvasElement, sets: Layer[][]): SkyGL | null {
   const gl = canvas.getContext("webgl", {
     alpha: true,
     premultipliedAlpha: true,
@@ -147,6 +157,8 @@ export function createSkyGL(canvas: HTMLCanvasElement, sets: Layer[][] = [BANKS]
     failIfMajorPerformanceCaveat: true,
   });
   if (!gl) return null;
+  // A fake context lacks methods used later, which would throw mid-draw.
+  if (typeof WebGLRenderingContext === "undefined" || !(gl instanceof WebGLRenderingContext)) return null;
   // Sub-pixel motion across thousands of px needs highp; at mediump it steps.
   const high = gl.getShaderPrecisionFormat(gl.FRAGMENT_SHADER, gl.HIGH_FLOAT);
   if (!high || high.precision < 16) return null;
@@ -227,6 +239,16 @@ export function createSkyGL(canvas: HTMLCanvasElement, sets: Layer[][] = [BANKS]
     verts.set([x0, y0, x1, y0, x0, y1, x0, y1, x1, y0, x1, y1], at);
   }
 
+  /** WebGL reports errors instead of throwing, so a throw means it can't draw. Stop the sky rather than the page. */
+  function safely(step: () => void) {
+    try {
+      step();
+    } catch (e) {
+      lost = true;
+      console.warn("sky:", e);
+    }
+  }
+
   return {
     splats,
     resize(nw, nh, dpr) {
@@ -237,45 +259,47 @@ export function createSkyGL(canvas: HTMLCanvasElement, sets: Layer[][] = [BANKS]
     },
     setBanks(banks, set = 0) {
       bankSrc[set] = banks;
-      if (!lost) uploadBanks(set);
+      if (!lost) safely(() => uploadBanks(set));
     },
     draw(f) {
       if (lost || gl.isContextLost()) return;
-      gl.viewport(0, 0, canvas.width, canvas.height);
-      gl.clear(gl.COLOR_BUFFER_BIT);
-      // Draw each set in order, later over earlier.
-      sets.forEach((layers, set) => {
-        const src = bankSrc[set];
-        const tex = bankTex[set];
-        if (tex.length !== layers.length || !tex.every(Boolean)) return;
-        const states = f.sets[set] ?? [];
-        src.forEach((b, i) => {
-          const st = states[i] ?? { shift: 0, y: 0 };
-          geo.set([st.shift, b.tileW, b.top, b.height], i * 4);
-          off.set([0, st.y, layers[i].push, layers[i].thin], i * 4);
-          gl.activeTexture(gl.TEXTURE1 + i);
-          gl.bindTexture(gl.TEXTURE_2D, tex[i]);
+      safely(() => {
+        gl.viewport(0, 0, canvas.width, canvas.height);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        // Draw each set in order, later over earlier.
+        sets.forEach((layers, set) => {
+          const src = bankSrc[set];
+          const tex = bankTex[set];
+          if (tex.length !== layers.length || !tex.every(Boolean)) return;
+          const states = f.sets[set] ?? [];
+          src.forEach((b, i) => {
+            const st = states[i] ?? { shift: 0, y: 0 };
+            geo.set([st.shift, b.tileW, b.top, b.height], i * 4);
+            off.set([0, st.y, layers[i].push, layers[i].thin], i * 4);
+            gl.activeTexture(gl.TEXTURE1 + i);
+            gl.bindTexture(gl.TEXTURE_2D, tex[i]);
+          });
+          // Bounding box of the set's strips, padded by how far a stir can displace a cloud.
+          const top = Math.max(0, Math.min(...src.map((b, i) => b.top + (states[i]?.y ?? 0))) - 200);
+          const bottom = Math.min(h, Math.max(...src.map((b, i) => b.top + b.height + (states[i]?.y ?? 0))) + 200);
+          if (bottom <= top) return;
+          box(0, 0, top, w, bottom);
+          gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+          gl.bufferSubData(gl.ARRAY_BUFFER, 0, verts);
+          gl.useProgram(clouds);
+          gl.uniform2f(loc["c.uSize"], w, h);
+          gl.uniform1f(loc["c.uTime"], f.time);
+          gl.uniform4fv(loc["c.uGeo"], geo);
+          gl.uniform4fv(loc["c.uOff"], off);
+          gl.uniform4fv(loc["c.uWarp"], warps[set]);
+          if (splats) {
+            // Must match the array size the shader declares.
+            gl.uniform4fv(loc["c.uSplatA"], f.splatA.subarray(0, splats * 4));
+            gl.uniform4fv(loc["c.uSplatB"], f.splatB.subarray(0, splats * 4));
+            gl.uniform1i(loc["c.uSplats"], Math.min(f.splats, splats));
+          }
+          gl.drawArrays(gl.TRIANGLES, 0, 6);
         });
-        // Bounding box of the set's strips, padded by how far a stir can displace a cloud.
-        const top = Math.max(0, Math.min(...src.map((b, i) => b.top + (states[i]?.y ?? 0))) - 200);
-        const bottom = Math.min(h, Math.max(...src.map((b, i) => b.top + b.height + (states[i]?.y ?? 0))) + 200);
-        if (bottom <= top) return;
-        box(0, 0, top, w, bottom);
-        gl.bindBuffer(gl.ARRAY_BUFFER, quad);
-        gl.bufferSubData(gl.ARRAY_BUFFER, 0, verts);
-        gl.useProgram(clouds);
-        gl.uniform2f(loc["c.uSize"], w, h);
-        gl.uniform1f(loc["c.uTime"], f.time);
-        gl.uniform4fv(loc["c.uGeo"], geo);
-        gl.uniform4fv(loc["c.uOff"], off);
-        gl.uniform4fv(loc["c.uWarp"], warps[set]);
-        if (splats) {
-          // Must match the array size the shader declares.
-          gl.uniform4fv(loc["c.uSplatA"], f.splatA.subarray(0, splats * 4));
-          gl.uniform4fv(loc["c.uSplatB"], f.splatB.subarray(0, splats * 4));
-          gl.uniform1i(loc["c.uSplats"], Math.min(f.splats, splats));
-        }
-        gl.drawArrays(gl.TRIANGLES, 0, 6);
       });
     },
     dispose() {

@@ -24,7 +24,7 @@ import type {
 } from "@/lib/types";
 import { seatedTravellers } from "@/lib/types";
 import { noteRouteSwaps } from "./assemble";
-import { airportsOf as airportsFor, asker, resolveEndpoint as lookUpEndpoint } from "./asking";
+import { airportsOf as airportsFor, asker, resolveEndpoint as lookUpEndpoint, SHOPPING_TIMEOUT_MS } from "./asking";
 import { bookableFor, CandidatePool, stayNights } from "./candidates";
 import { compactForLLM, daysBetween, describeInput, PLACE_NAMES, itinToLeg, languageTag, queryFor, shiftDay, tripFacts, type IndexedItin } from "./core";
 import { metroCodes } from "./intake";
@@ -89,7 +89,7 @@ export type EngineOutcome = {
 };
 
 /** Search deadlines. Open-destination searches run several rounds, so they get longer. Both stay under the route's 200 s limit. */
-export const DEFAULT_DEADLINE_MS = 90_000;
+export const DEFAULT_DEADLINE_MS = 120_000;
 export const OPEN_DEADLINE_MS = 176_000;
 /** Grid cells (and hinted dates) the engine buys real itineraries for. */
 const CELLS_TO_PRICE = 6;
@@ -106,9 +106,10 @@ const PLACES_PER_ROUND = 12;
 const MAX_PLACE_PLANS = 3;
 /** One-way tickets each way kept for pairing. */
 const ONE_WAYS_TO_PAIR = 8;
-/** Extra wait for stays past three weeks after the rest of the first stage, cut short to leave the reserve for later stages. */
+/** Time reserved for the later stages. The first stage stops waiting for optional calls once only this much is left. */
+const RESERVE_MS = 30_000;
+/** Extra wait for stays past three weeks after the rest of the first stage, cut short to leave the reserve. */
 const LONG_STAYS_GRACE_MS = 4_000;
-const LONG_STAYS_RESERVE_MS = 30_000;
 
 /** One origin × destination pair: airport codes to show (o, d) and query endpoints (oq, dq), which may be place ids. */
 export type Combo = { o: string; d: string; oq: string; dq: string };
@@ -166,6 +167,10 @@ export async function runSearch(
   const { must, settleCalendar, unanswered } = asker({ signal: killer.signal, log, onAsk: () => queries++ });
   // Stays past three weeks only add cells to a complete grid, and the provider answers them unreliably, so a miss is tolerated.
   const extra = asker({ signal: killer.signal, log, onAsk: () => queries++, bestEffort: true });
+  // The traveller's own search when the grid also prices those dates (`ownSearch`). A miss is tolerated, and it's cancelled
+  // once the first stage stops waiting, so a late answer can't land while widening buys the same dates.
+  const ownStop = new AbortController();
+  const own = asker({ signal: AbortSignal.any([killer.signal, ownStop.signal]), log, onAsk: () => queries++, bestEffort: true });
 
   try {
     hooks.phase("starting");
@@ -176,19 +181,25 @@ export async function runSearch(
      * Round trips are asked by airport code, since a place id is much slower for them and often dearer for the same flights.
      * One-ways, grids and graphs use the place, where one call covers all its airports. See `roundTrips`.
      */
+    /** Asks one shopping call until it answers. Pass a best-effort asker's `must` for a call the search can do without. */
+    const askShopping = (input: SearchInput, what: string, attempts = 2, ask = must) =>
+      ask((signal) => backend.shopping(input, { signal, hedgeMs: 2_000, timeoutMs: SHOPPING_TIMEOUT_MS, attempts }), what);
+    /** Adds an answer's fares to the pool. */
+    const take = (payload: ShoppingPayload, input: SearchInput, what: string, shift?: { out: number; ret: number }) => {
+      const added = pool.add(payload.itineraries, input, queries, shift);
+      for (const pl of payload.places ?? []) if (pl.image && !photos.has(pl.code)) photos.set(pl.code, pl.image);
+      const cheapest = Math.min(...payload.itineraries.map((i) => i.price ?? Infinity));
+      log(`  ${describeInput(input)} → ${payload.itineraries.length} itineraries${Number.isFinite(cheapest) ? ` from ${fmt(cheapest)}` : ""} — ${what}`, "info");
+      return { payload, added };
+    };
     const shop = (input: SearchInput, what: string, shift?: { out: number; ret: number }, attempts = 2) =>
-      must((signal) => backend.shopping(input, { signal, hedgeMs: 2_000, timeoutMs: 8_000, attempts }), what).then((payload) => {
-        if (!payload) return null;
-        const added = pool.add(payload.itineraries, input, queries, shift);
-        for (const pl of payload.places ?? []) if (pl.image && !photos.has(pl.code)) photos.set(pl.code, pl.image);
-        const cheapest = Math.min(...payload.itineraries.map((i) => i.price ?? Infinity));
-        log(`  ${describeInput(input)} → ${payload.itineraries.length} itineraries${Number.isFinite(cheapest) ? ` from ${fmt(cheapest)}` : ""} — ${what}`, "info");
-        return { payload, added };
-      });
+      askShopping(input, what, attempts).then((payload) => (payload ? take(payload, input, what, shift) : null));
 
     // An object rather than `let`s: the payloads are assigned in callbacks, and narrowing would treat a `let` as always null.
     const got: { baseline: ShoppingPayload | null; bagless: ShoppingPayload | null } = { baseline: null, bagless: null };
     const oneWays: { out: IndexedItin[]; ret: IndexedItin[] } = { out: [], ret: [] };
+    /** Destinations whose own search didn't fully answer in time (`ownSearch`). Widening can still buy those dates. */
+    const ownUnanswered = new Set<string>();
 
     /* ---- Stage 0: plan ---- */
     hooks.phase("planning");
@@ -272,13 +283,23 @@ export async function runSearch(
     let explore: ExploreDestination[] = [];
     /** Airports a place's round trips are asked from: its own first, then grouped or nearby ones, three at most. */
     const airportsOf = (code: string): string[] => airportsFor(code, ends.get(code));
-    /** Buys one round trip, a call per airport pair at both ends. An open-jaw trip keeps its own arrival and return airports. */
-    const roundTrips = (o: string, d: string, out: string, ret: string | null, what: string, shift: { out: number; ret: number }, attempts = 2, back?: string) =>
-      Promise.all(
-        airportsOf(o).flatMap((f) =>
-          (back && back !== d ? [d] : airportsOf(d)).map((t) => shop(queryFor(req, f, t, out, ret, "", back && back !== d ? back : undefined), `${what}${f !== o ? ` from ${f}` : ""}${t !== d ? ` into ${t}` : ""}`, shift, attempts))
-        )
+    /** One round trip's calls, one per airport pair at both ends. An open-jaw trip keeps its own arrival and return airports. */
+    const roundTripCalls = (o: string, d: string, out: string, ret: string | null, what: string, back?: string) =>
+      airportsOf(o).flatMap((f) =>
+        (back && back !== d ? [d] : airportsOf(d)).map((t) => ({ input: queryFor(req, f, t, out, ret, "", back && back !== d ? back : undefined), what: `${what}${f !== o ? ` from ${f}` : ""}${t !== d ? ` into ${t}` : ""}` }))
       );
+    /** Buys one round trip, a call per airport pair at both ends. */
+    const roundTrips = (o: string, d: string, out: string, ret: string | null, what: string, shift: { out: number; ret: number }, attempts = 2, back?: string) =>
+      Promise.all(roundTripCalls(o, d, out, ret, what, back).map((c) => shop(c.input, c.what, shift, attempts)));
+    /**
+     * The own search when the grid also prices those dates, so the search can continue without it. Returns each airport's call
+     * and answer, or null if any call never answered. All or nothing, so one airport's dearer fares can't stand in for the dates.
+     */
+    const ownSearch = async (o: string, d: string, what: string) => {
+      const calls = roundTripCalls(o, d, outDate, retDate, what);
+      const answers = await Promise.all(calls.map((c) => askShopping(c.input, c.what, 2, own.must)));
+      return answers.every(Boolean) ? calls.map((c, i) => ({ ...c, payload: answers[i]! })) : null;
+    };
     /** Of the answers for one trip from several airports, the one with the cheapest fare. */
     const cheapestOf = (rs: ({ payload: ShoppingPayload } | null)[]): ShoppingPayload | null => {
       const low = (p: ShoppingPayload) => Math.min(...p.itineraries.map((i) => i.price ?? Infinity));
@@ -415,16 +436,32 @@ export async function runSearch(
       const jobs: Promise<unknown>[] = [];
       const longJobs: Promise<unknown>[] = [];
       const base = queryFor(req, combos[0].o, combos[0].d, outDate, retDate, "your own search");
+      // For flexible round trips the grid also prices the asked dates, so their own search may go unanswered and widening buys
+      // them like any other cell. Widening only buys from the first origin, so other origins still require their own search.
+      const ownOptional = flexible && !!retWin && !!retDate;
+      const ownWhat = (d: string) => (combos.length > 1 ? `your own search to ${d}` : "your own search");
+      const ownJobs: Promise<unknown>[] = [];
+      /** Destinations whose optional own search is still asking. */
+      const ownAsking = new Set<string>();
       for (const { o, d } of combos) {
-        jobs.push(
-          roundTrips(o, d, outDate, retDate, combos.length > 1 ? `your own search to ${d}` : "your own search", { out: 0, ret: 0 }).then((rs) => noteBaseline(cheapestOf(rs), d))
-        );
+        if (ownOptional && o === from) {
+          ownAsking.add(d);
+          ownJobs.push(
+            ownSearch(o, d, ownWhat(d)).then((calls) => {
+              // Cancelled below because widening may buy those dates itself, so a late answer is ignored.
+              if (ownStop.signal.aborted) return;
+              ownAsking.delete(d);
+              if (!calls) return void ownUnanswered.add(d);
+              noteBaseline(cheapestOf(calls.map((c) => take(c.payload, c.input, c.what, { out: 0, ret: 0 }))), d);
+            })
+          );
+        } else jobs.push(roundTrips(o, d, outDate, retDate, ownWhat(d), { out: 0, ret: 0 }).then((rs) => noteBaseline(cheapestOf(rs), d)));
       }
       if (req.bags.carryOn || req.bags.checked) {
         // For insights and hints only. These fares lack the asked bags, so they stay out of the pool. Widening uses the hints,
         // so this call is awaited like the rest.
         const bagless: SearchInput = { ...base, carry_on_bags: undefined, checked_bags: undefined };
-        jobs.push(must((signal) => backend.shopping(bagless, { signal, hedgeMs: 2_000, timeoutMs: 8_000, attempts: 2 }), "price insights").then((p) => void (got.bagless = p)));
+        jobs.push(askShopping(bagless, "price insights").then((p) => void (got.bagless = p)));
       }
       if (retDate) {
         // Each direction as a one-way, for pairing across carriers (and across airports when mixing is allowed).
@@ -464,19 +501,40 @@ export async function runSearch(
           jobs.push(settleCalendar(`prices to ${d} by departure date`, (signal, enough) => backend.priceGraph(queryFor(req, oq, dq, outDate, null), outWin, [1, 1], { signal, settleMs: 2_500, timeoutMs: 5_000, hedgeMs: 1_500, enough }), daysOf(outWin).length, (pts) => takeGraph(graphsOut, `${o}~${d}`, pts)));
       }
       await Promise.allSettled(jobs);
+      // An optional own search gets whatever time the later stages can spare. One still asking after that is cancelled, so the
+      // rest of the search keeps its time.
+      if (ownJobs.length) {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const cutoff = new Promise<void>((res) => (timer = setTimeout(res, Math.max(0, left() - RESERVE_MS))));
+        await Promise.race([Promise.allSettled(ownJobs), cutoff]);
+        clearTimeout(timer);
+        for (const d of ownAsking) {
+          log(`  ${ownWhat(d)}: still asking with ${Math.round(left() / 1000)} s left — going on without it`, "info");
+          ownUnanswered.add(d);
+        }
+        if (ownAsking.size) ownStop.abort();
+      }
       // Long stays only add cells, so they get a short grace period. A late answer still lands in the grid before it's rebuilt.
       if (longJobs.length) {
         let timer: ReturnType<typeof setTimeout> | undefined;
-        const cutoff = new Promise<void>((res) => (timer = setTimeout(res, Math.max(0, Math.min(LONG_STAYS_GRACE_MS, left() - LONG_STAYS_RESERVE_MS)))));
+        const cutoff = new Promise<void>((res) => (timer = setTimeout(res, Math.max(0, Math.min(LONG_STAYS_GRACE_MS, left() - RESERVE_MS)))));
         await Promise.race([Promise.allSettled(longJobs), cutoff]);
         clearTimeout(timer);
       }
+      // An own search that didn't answer falls back to the grid's price for its dates. With no grid price, it counts as unanswered.
+      for (const d of ownUnanswered) {
+        const what = ownWhat(d);
+        const priced = grids.some((g) => g.d === d && g.cells.has(cellKey(outDate, retDate ?? "")));
+        log(`${what.charAt(0).toUpperCase()}${what.slice(1)} didn't answer from every airport in time, so none of it is kept${priced ? "; the grid prices those dates" : ", and the grid has no price for those dates"}`, priced ? "info" : "error");
+        if (!priced) unanswered.push(what);
+      }
       allAnswered();
-      if (pool.baseline != null) log(`Your own search comes to ${fmt(pool.baseline)}${combos.length > 1 ? ` at best, across ${combos.length} searches` : ""}`, "success");
+      if (pool.baseline != null && !ownUnanswered.size) log(`Your own search comes to ${fmt(pool.baseline)}${combos.length > 1 ? ` at best, across ${combos.length} searches` : ""}`, "success");
       const ins = withInsights()?.insights;
       if (ins?.level) log(`Prices for this trip are currently ${ins.level}`, "info");
       const asked = (codes: string[]) => [...new Set(codes.flatMap(airportsOf))].join("/");
       notes.push(`Priced the trip as asked${combos.length > 1 ? ` to ${combos.length} places` : ""}, round trips from ${asked(origins)} to ${asked(dests)}${retDate ? ", both directions on their own" : ""}${grids.length ? `, ${grids.length} price grid${grids.length > 1 ? "s" : ""}` : ""}${graphsOut.size ? `, ${graphsOut.size + graphsBack.size} one-way price graphs` : ""}`);
+      if (ownUnanswered.size) notes.push(`The round trip on their own dates${combos.length > 1 ? ` to ${[...ownUnanswered].join(" and ")}` : ""} didn't answer from every airport in time, so none of its fares were kept; the grid priced those dates`);
     }
 
     /* ---- Open destination: the rounds, and the model's choice ---- */
@@ -627,10 +685,14 @@ export async function runSearch(
         hooks.phase("widening");
         const bl = withInsights();
         const hinted = new Set<string>(askedCells); // bought early, as their grid came in
-        // The grid's cheapest cells, cells serving the stated preference, and the provider's date hints.
-        const cells = (gridView?.cells ?? []).filter((c) => c.price != null && !(c.outDate === outDate && c.returnDate === retDate)).sort((a, b) => a.price! - b.price!);
+        // The grid's cheapest cells, cells serving the stated preference, and the provider's date hints. The asked dates were
+        // bought in the first stage (two-ticket cells through the one-ways), unless their own search never answered, in which
+        // case they're a cell like any other.
+        const isAsked = (c: GridCell) => c.outDate === outDate && c.returnDate === retDate;
+        const boughtAsked = (c: GridCell) => isAsked(c) && (c.via?.tickets === "two" || !ownUnanswered.has(c.via?.out ?? dests[0]));
+        const cells = (gridView?.cells ?? []).filter((c) => c.price != null && !boughtAsked(c)).sort((a, b) => a.price! - b.price!);
         const worthIt: GridCell[] = cells.filter((c) => pool.baseline == null || c.price! < pool.baseline * 1.02).slice(0, CELLS_TO_PRICE);
-        // The cheapest cell besides the asked dates. The page quotes it, so it gets one more attempt than the rest.
+        // The cheapest cell to buy. The page quotes it, so it gets one more attempt than the rest.
         const lead = worthIt[0] ?? null;
         if (plan.dates.prefer !== "none" && cells.length) {
           const nightsOf = (c: GridCell) => daysBetween(c.outDate, c.returnDate);
@@ -662,7 +724,16 @@ export async function runSearch(
             oneWay("out", fromQ, endpointOf(to), c.outDate, shift.out, attempts);
             oneWay("back", endpointOf(back), fromQ, ret, shift.ret, attempts);
           } else {
-            jobs.push(buyCell(c, attempts));
+            // On the asked dates, into one airport and from the first origin, these calls are the own search, so they count as it.
+            const own = isAsked(c) && back === to && ownUnanswered.has(to);
+            jobs.push(
+              buyCell(c, attempts).then((rs) => {
+                if (!own || !ownUnanswered.has(to) || !rs.every(Boolean)) return;
+                ownUnanswered.delete(to);
+                noteBaseline(cheapestOf(rs), to);
+                notes.push(`The round trip on their own dates${combos.length > 1 ? ` to ${to}` : ""} answered when asked again with the cheapest dates`);
+              })
+            );
           }
         }
         for (const h of bl?.airportHints ?? []) {
@@ -677,6 +748,8 @@ export async function runSearch(
       allAnswered();
     }
     if (gridView) gridView = assembleGrid(plan, combos, grids, graphsOut, graphsBack, pool, usable) ?? gridView;
+    // The own search, used for comparisons. A partial answer is left out, since its cheapest fare may not be the real cheapest.
+    const baseline = ownUnanswered.size ? null : pool.baseline;
 
     if (pool.size === 0) {
       const when = `${flexible ? "around" : "on"} ${dayRange(outDate, retDate, req.locale)}`;
@@ -853,12 +926,12 @@ export async function runSearch(
     if (underPlans)
       log(`The grid's cheapest days, ${underPlans.outDate}${retWin ? ` → ${underPlans.returnDate}` : ""} from ${fmt(underPlans.price)}, are not among the plans: ${underPlans.found == null ? "there were no flights on them when asked" : passedOver ? `a fare on them came back at ${fmt(underPlans.found)} and the picks passed it over` : `their flights came back from ${fmt(underPlans.found)}`}`, "info");
     const verdict: Verdict = {
-      baseline: pool.baseline,
+      baseline,
       best,
-      saved: pool.baseline != null ? pool.baseline - best : null,
+      saved: baseline != null ? baseline - best : null,
       ...(gridCheaper ? { gridCheaper } : {}),
-      ...(pool.baseline != null && pool.baseline - best <= 0
-        ? { couldNotBeat: `Searching it the way you described came to ${fmt(pool.baseline)}${combos.length > 1 ? " at best" : ""}, and nothing among the ${pool.size} itineraries I checked was under it.` }
+      ...(baseline != null && baseline - best <= 0
+        ? { couldNotBeat: `Searching it the way you described came to ${fmt(baseline)}${combos.length > 1 ? " at best" : ""}, and nothing among the ${pool.size} itineraries I checked was under it.` }
         : {}),
     };
 
@@ -913,8 +986,8 @@ export async function runSearch(
                 : ""),
           plans,
           verdictLine:
-            pool.baseline != null
-              ? `Their own search, exactly as asked, came to ${fmt(pool.baseline)}${combos.length > 1 ? " at best" : ""}. The cheapest plan is ${fmt(best)}${verdict.saved! > 0 ? ` — ${fmt(verdict.saved!)} less` : verdict.saved! < 0 ? ` — ${fmt(-verdict.saved!)} more, because nothing cheaper was found` : " — the same"}.`
+            baseline != null
+              ? `Their own search, exactly as asked, came to ${fmt(baseline)}${combos.length > 1 ? " at best" : ""}. The cheapest plan is ${fmt(best)}${verdict.saved! > 0 ? ` — ${fmt(verdict.saved!)} less` : verdict.saved! < 0 ? ` — ${fmt(-verdict.saved!)} more, because nothing cheaper was found` : " — the same"}.`
               : open
                 ? "There is no single trip to compare against: the destination was open."
                 : "Their own exact search could not be priced.",
@@ -951,7 +1024,7 @@ export async function runSearch(
       verdict,
       view,
       plan: planView,
-      session: { baseline: pool.baseline, rows, roundNotes: notes, concludedBecause: "one pass, inside the deadline" },
+      session: { baseline, rows, roundNotes: notes, concludedBecause: "one pass, inside the deadline" },
       stats: {
         durationMs,
         queries,

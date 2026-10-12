@@ -17,6 +17,11 @@ export const ASK_AGAIN_MS = 600;
 export const CALENDAR_ASKS = 4;
 /** Airports asked per end of a round trip: the place's own plus grouped or nearby ones. */
 export const AIRPORTS_PER_END = 3;
+/**
+ * Timeout for each shopping request and its hedge. Cold long-haul searches can take about 8 s, and a fare's first
+ * returns request about 9 s.
+ */
+export const SHOPPING_TIMEOUT_MS = 12_000;
 
 /** Thrown when calls never answered, so nothing is built from partial answers. */
 export class Unanswered extends Error {
@@ -70,7 +75,8 @@ export function asker(opts: { signal: AbortSignal; log?: Log; onAsk?: () => void
         if (signal.aborted) break;
         const err = e instanceof FlightsError ? e : new FlightsError("HTTP_ERROR", (e as Error).message);
         log(`  ${what} ✗ ${err.kind}: ${err.message.slice(0, 160)}${ask < ASKS ? " — asking again" : ""}`, missKind);
-        await pause(ASK_AGAIN_MS * ask);
+        // No pause after the last ask; it would only delay the stage waiting on this call.
+        if (ask < ASKS) await pause(ASK_AGAIN_MS * ask);
       }
     }
     missed(what);

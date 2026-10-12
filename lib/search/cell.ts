@@ -2,7 +2,7 @@ import type { FlightBackend } from "@/lib/flights/backend";
 import type { Itinerary } from "@/lib/flights/types";
 import { AIRPORTS } from "@/lib/airports";
 import type { FlightPlan, SearchRequest } from "@/lib/types";
-import { airportsOf, asker, resolveEndpoint, type Endpoint } from "./asking";
+import { airportsOf, asker, resolveEndpoint, SHOPPING_TIMEOUT_MS, type Endpoint } from "./asking";
 import { plansFromItineraries, plansFromOneWays, topPriced } from "./assemble";
 import { describeInput, queryFor, type CompactRow } from "./core";
 
@@ -40,7 +40,7 @@ export async function flightsForCell(opts: {
   asking.allAnswered();
   const endpointOf = (code: string) => ends.get(code)?.q ?? code;
   const shopping = (input: ReturnType<typeof queryFor>) =>
-    asking.must((signal) => backend.shopping(input, { signal, hedgeMs: 2_000, timeoutMs: 8_000, attempts: 2 }), describeInput(input));
+    asking.must((signal) => backend.shopping(input, { signal, hedgeMs: 2_000, timeoutMs: SHOPPING_TIMEOUT_MS, attempts: 2 }), describeInput(input));
 
   if (ask.tickets === "two" && returnDate) {
     const inputOut = queryFor(req, endpointOf(from), endpointOf(to), outDate, null);
