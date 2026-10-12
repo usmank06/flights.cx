@@ -568,6 +568,12 @@ body {
   background: var(--color-accent);
 }
 
+/* Thin scrollbar for the rail's chat index, in the rule color. */
+.rail-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-rule-strong) transparent;
+}
+
 /* Horizontal scrollers without a visible bar. */
 .no-scrollbar {
   scrollbar-width: none;

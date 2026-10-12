@@ -302,7 +302,9 @@ export function SearchView({ initial, estimate = null }: { initial: SearchRecord
             <aside data-rail className="hidden lg:block" aria-label="This search">
               {/* z-10: the price popover opens over the pane. */}
               {/* top-22 (56px header + 32px) is where it already sits, so it doesn't shift on scroll; pt-8 levels it with the trip. */}
-              <div className="sticky top-22 z-10 flex flex-col gap-0.5 pt-8">
+              {/* Capped at the viewport minus top-22 and the How it works pill (1rem + 2.5rem + 1rem), so only the chat index scrolls. */}
+              {/* data-short (set in chat-index.tsx) means the window is too short for that, so the rail scrolls with the page. */}
+              <div className="sticky top-22 z-10 flex max-h-[calc(100dvh-10rem)] flex-col gap-0.5 pt-8 data-short:static data-short:max-h-none">
                 {done && <RailFreshness capturedAt={record.capturedAt} locale={req.locale} />}
                 <EditSearchButton onClick={() => setEditing(true)} />
                 {done && record.capturedAt && <SearchAgainButton slug={record.slug} />}
