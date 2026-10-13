@@ -89,7 +89,7 @@ export async function runClaimedWatch({ watch, holder }: ClaimedWatch, now = new
       return { id: watch.id, outcome: "search-failed" };
     }
 
-    const verdict = shouldNotify(watch, best);
+    const verdict = shouldNotify(watch, best, rerun.verdict?.incomplete != null);
     let sent = false;
     if (verdict.notify) {
       sent = await mailPriceMove(watch, rerun.slug, best, rerun.plans?.find((p) => p.price === best) ?? null);

@@ -234,8 +234,24 @@ export type Verdict = {
   /**
    * The grid's cheapest days, when well under every plan because the grid price wasn't a real fare: no flights on them when searched
    * (`found` null), or a higher price. Not set when those days did price near the grid and the picks passed them over.
+   * `unconfirmed`: they were asked but never answered in time, so a null `found` doesn't mean there were no flights.
    */
-  gridCheaper?: { outDate: string; returnDate: string; price: number; found: number | null };
+  gridCheaper?: { outDate: string; returnDate: string; price: number; found: number | null; unconfirmed?: true };
+  /** Set when lookups never answered in time and the search went on without them. */
+  incomplete?: Incomplete;
+};
+
+/** Lookups a search left out because they never answered in time. The page notes them under the write-up. */
+export type Incomplete = {
+  /**
+   * Dates not every lookup answered for, cheapest on the grid first. `returnDate` is null on a one-way; `route` names the
+   * route when the search had several ("to Porto", "from Detroit").
+   */
+  dates: { outDate: string; returnDate: string | null; route?: string }[];
+  /** Part of the date grid, or of the one-way prices by date, never came back. */
+  grid: boolean;
+  /** Other lookups that never answered: a direction on its own, the price insights, a hinted airport, a place. */
+  other: number;
 };
 
 /* --------------------------------- Views --------------------------------- */
@@ -334,6 +350,8 @@ export type SearchStats = {
   tokensIn: number;
   tokensOut: number;
   costUsd: number | null;
+  /** Lookups that never answered in time, which the search went on without. Absent on older searches. */
+  missed?: number;
 };
 
 /** How the search read the brief, for the page. Dates are ISO; the page formats them. */

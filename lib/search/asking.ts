@@ -6,8 +6,8 @@ import { PLACE_NAMES } from "./core";
 import { metroCodes } from "./intake";
 
 /**
- * Retries provider calls until they answer or the caller's deadline passes. Anything left unanswered is recorded, and the
- * caller ends with an error instead of showing partial results.
+ * Retries provider calls until they answer or the caller's signal stops them. Unanswered calls are recorded. A search
+ * continues without them and says so; a grid cell's flights, the chat's grid and a follow-up end with an error instead.
  */
 
 /** Attempts per call before it counts as unanswered (`must`), and the base pause between attempts, which grows each time. */
@@ -18,8 +18,9 @@ export const CALENDAR_ASKS = 4;
 /** Airports asked per end of a round trip: the place's own plus grouped or nearby ones. */
 export const AIRPORTS_PER_END = 3;
 /**
- * Timeout for each shopping request and its hedge. Cold long-haul searches can take about 8 s, and a fare's first
- * returns request about 9 s.
+ * Timeout for each shopping request and its hedge. A cold long-haul search takes about 8 s, so this lets it answer on the
+ * first ask. The provider keeps working after a request gives up, so a shorter timeout wouldn't get an answer any sooner.
+ * A fare's first returns request takes about 9 s.
  */
 export const SHOPPING_TIMEOUT_MS = 12_000;
 
@@ -36,8 +37,8 @@ type Log = (text: string, kind?: "info" | "action" | "success" | "error") => voi
 export type Asker = {
   /** Runs one provider call until it answers. Returns null if it never does, and records it in `unanswered`. */
   must: <T>(fn: (signal: AbortSignal) => Promise<T>, what: string) => Promise<T | null>;
-  /** Asks a calendar until it is complete (see below). */
-  settleCalendar: (what: string, call: (signal: AbortSignal, enough?: number) => Promise<DatePricePoint[]>, expected: number, onAnswer: (pts: DatePricePoint[]) => void, counts?: (p: DatePricePoint) => boolean) => Promise<void>;
+  /** Asks a calendar until it is complete (see below). Returns false if it never answered or never stopped changing. */
+  settleCalendar: (what: string, call: (signal: AbortSignal, enough?: number) => Promise<DatePricePoint[]>, expected: number, onAnswer: (pts: DatePricePoint[]) => void, counts?: (p: DatePricePoint) => boolean) => Promise<boolean>;
   /** A pause the caller's deadline cuts short. */
   pause: (ms: number) => Promise<void>;
   /** Calls that never answered, in the order they gave up. */
@@ -47,8 +48,9 @@ export type Asker = {
 };
 
 /**
- * `signal` is the caller's deadline, the only clock over every call. `onAsk` counts each attempt for stats. With `bestEffort`,
- * misses are logged but not recorded as unanswered, for optional extras such as long-stay grid cells.
+ * `signal` is the only clock for every call: the caller's deadline, or when a search stage stops waiting. `onAsk` counts each
+ * attempt for stats. With `bestEffort`, misses are logged but not recorded as unanswered (for optional extras such as
+ * long-stay grid cells).
  */
 export function asker(opts: { signal: AbortSignal; log?: Log; onAsk?: () => void; bestEffort?: boolean }): Asker {
   const { signal } = opts;
@@ -80,7 +82,7 @@ export function asker(opts: { signal: AbortSignal; log?: Log; onAsk?: () => void
       }
     }
     missed(what);
-    log(`  ${what}: no answer ${signal.aborted ? "before the deadline" : `after ${ASKS} asks`}${opts.bestEffort ? " — going on without it" : ""}`, missKind);
+    log(`  ${what}: no answer ${signal.aborted ? "in time" : `after ${ASKS} asks`}${opts.bestEffort ? " — going on without it" : ""}`, missKind);
     return null;
   };
 
@@ -95,21 +97,21 @@ export function asker(opts: { signal: AbortSignal; log?: Log; onAsk?: () => void
     for (let ask = 1; ; ask++) {
       const enough = ask > 1 && held.size >= expected * 0.6 ? held.size : undefined;
       const pts = await must((s) => call(s, enough), ask > 1 ? `${what}, ask ${ask}` : what);
-      if (!pts) return; // unanswered, already recorded
+      if (!pts) return false; // unanswered, already recorded
       const fresh = new Set(pts.filter((p) => p.price != null && (!p.returnDate || p.returnDate > p.outDate) && (!counts || counts(p))).map((p) => `${p.outDate}~${p.returnDate ?? ""}`));
       const added = [...fresh].filter((k) => !held.has(k)).length;
       const covers = fresh.size >= held.size * 0.9;
       for (const k of fresh) held.add(k);
       onAnswer(pts);
-      if (held.size >= expected) return;
+      if (held.size >= expected) return true;
       if (ask > 1 && !added && covers) {
         log(`${cap(what)}: ${held.size} of ${expected}, and nothing new when asked again, so that's all of it`, "info");
-        return;
+        return true;
       }
       if (ask >= CALENDAR_ASKS) {
         missed(`${what}, still changing after ${CALENDAR_ASKS} asks`);
         log(`${cap(what)}: ${held.size} of ${expected}, still changing after ${CALENDAR_ASKS} asks${opts.bestEffort ? " — keeping what came back" : ""}`, missKind);
-        return;
+        return false;
       }
       log(`${cap(what)}: ${held.size} of ${expected}, asking again to make sure that's all`, "info");
       await pause(ASK_AGAIN_MS);

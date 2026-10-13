@@ -215,7 +215,7 @@ export async function executeSearch(
           priceRankedFallback: out.stats.jev !== "used",
           unencoded: out.unencoded.map((u) => u.field),
         },
-        { signedIn: Boolean(record.userId), detail: { jev: out.stats.jev, voice: out.stats.voice } }
+        { signedIn: Boolean(record.userId), detail: { jev: out.stats.jev, voice: out.stats.voice, missed: out.stats.missed ?? 0 } }
       )
     );
     return finished ?? { ...record, ...out, status: "done", phase: "done", events };

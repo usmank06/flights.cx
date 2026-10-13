@@ -125,11 +125,12 @@ export const WATCH_LOCK_MS = 5 * 60_000;
 
 /**
  * Whether the new price crosses the watch's trigger. Pure, so it's easy to test. Compares against the last alerted price, or the
- * reference price before any alert.
+ * reference price before any alert. `incomplete`: the re-run left lookups out (`Verdict.incomplete`).
  */
 export function shouldNotify(
   watch: Pick<PriceWatch, "trigger" | "referencePrice" | "lastNotifiedPrice">,
-  price: number
+  price: number,
+  incomplete = false
 ): { notify: boolean; reason: string } {
   const previous = watch.lastNotifiedPrice ?? watch.referencePrice;
   // A zero reference would divide by zero below and the watch would go silent, so bail out explicitly.
@@ -146,6 +147,8 @@ export function shouldNotify(
       : { notify: false, reason: "already told them about a price this low" };
   }
 
+  // A re-run that left lookups out may have missed the cheapest fare, so a rise isn't reported. A drop is a real fare.
+  if (incomplete && price > previous) return { notify: false, reason: "rose, but the re-run left lookups out" };
   const movePct = Math.abs((price - previous) / previous) * 100;
   if (movePct < watch.trigger.percent) return { notify: false, reason: "has not moved enough" };
   return { notify: true, reason: price < previous ? "dropped" : "rose" };

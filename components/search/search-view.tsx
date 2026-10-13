@@ -22,6 +22,7 @@ import { FollowUps, useAsk } from "@/components/results/follow-ups";
 import { preloadLogos } from "@/components/results/airline-logo";
 import { carrierCodes, endsFlown, placeOf, plansDifferOnlyInPrice, type Named } from "@/components/results/plan-meta";
 import { ChatIndex } from "@/components/results/chat-index";
+import { leftOutLine } from "@/components/results/left-out";
 import { addDays, rangeLabel, shortDay, todayDay } from "./dates";
 import { TripSummary } from "./edit-search";
 import { SearchProgress, takesAbout } from "./progress";
@@ -280,12 +281,20 @@ export function SearchView({ initial, estimate = null }: { initial: SearchRecord
   const rail = running || (done && (n > 0 || record.followUps.length >= 2));
   // Grid days cheaper than every plan: the grid price wasn't a bookable fare (no flights, or pricier when checked).
   const missed = done && n > 0 && grid ? (v?.gridCheaper ?? null) : null;
-  const seeMissed = () => {
-    if (!missed || !grid) return;
-    const cell = grid.cells.find((c) => c.outDate === missed.outDate && c.returnDate === missed.returnDate);
-    setGridFocus({ out: missed.outDate, ret: missed.returnDate, via: cell?.via });
+  const seeInGrid = (days: { outDate: string; returnDate: string }) => {
+    if (!grid) return;
+    const cell = grid.cells.find((c) => c.outDate === days.outDate && c.returnDate === days.returnDate);
+    setGridFocus({ out: days.outDate, ret: days.returnDate, via: cell?.via });
     void openGrid();
   };
+  // Lookups that never answered in time, apart from the dates the note above already covers.
+  const leftOut = done && n > 0 && v?.incomplete ? leftOutLine(v.incomplete, req.locale, missed?.unconfirmed ? missed : null) : null;
+  const leftOutDays =
+    (leftOut && grid
+      ? (v?.incomplete?.dates ?? []).flatMap(({ outDate, returnDate }) =>
+          returnDate && !(missed?.unconfirmed && outDate === missed.outDate && returnDate === missed.returnDate) && grid.cells.some((c) => c.outDate === outDate && c.returnDate === returnDate) ? [{ outDate, returnDate }] : []
+        )[0]
+      : null) ?? null;
 
   const insight = done && view && view.kind !== "open" ? <InsightChip insights={view.insights} hints={view.hints} currency={req.currency} locale={req.locale} /> : null;
   const railInsight = done && view && view.kind !== "open" ? <InsightChip wide insights={view.insights} hints={view.hints} currency={req.currency} locale={req.locale} /> : null;
@@ -355,10 +364,23 @@ export function SearchView({ initial, estimate = null }: { initial: SearchRecord
                   <p className="max-w-[44rem] text-[13.5px] leading-relaxed text-ink-muted">
                     {grid && grid.returnDates.length ? rangeLabel(missed.outDate, missed.returnDate, req.locale) : shortDay(missed.outDate, req.locale)} looked cheaper at{" "}
                     <span className="nums">{money(missed.price, req.currency, req.locale)}</span> in the date grid, but{" "}
-                    {missed.found == null ? "we couldn’t find those flights when we checked" : <>when we checked, the best we found was <span className="nums">{money(missed.found, req.currency, req.locale)}</span></>}.{" "}
-                    <button type="button" onClick={seeMissed} className="font-semibold text-accent hover:underline">
+                    {missed.unconfirmed ? "we couldn’t confirm those dates in time" : missed.found == null ? "we couldn’t find those flights when we checked" : <>when we checked, the best we found was <span className="nums">{money(missed.found, req.currency, req.locale)}</span></>}.{" "}
+                    <button type="button" onClick={() => seeInGrid(missed)} className="font-semibold text-accent hover:underline">
                       See them in the grid
                     </button>
+                  </p>
+                )}
+                {leftOut && (
+                  <p className="max-w-[44rem] text-[13.5px] leading-relaxed text-warn">
+                    {leftOut}
+                    {leftOutDays && (
+                      <>
+                        {" "}
+                        <button type="button" onClick={() => seeInGrid(leftOutDays)} className="font-semibold text-accent hover:underline">
+                          See them in the grid
+                        </button>
+                      </>
+                    )}
                   </p>
                 )}
                 {same && <p className="text-[13.5px] text-warn">These are the same flights, just at different prices.</p>}
