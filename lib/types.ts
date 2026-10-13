@@ -244,8 +244,9 @@ export type Verdict = {
 /** Lookups a search left out because they never answered in time. The page notes them under the write-up. */
 export type Incomplete = {
   /**
-   * Dates not every lookup answered for, cheapest on the grid first. `returnDate` is null on a one-way; `route` names the
-   * route when the search had several ("to Porto", "from Detroit").
+   * Dates not every lookup answered for, cheapest on the grid first. `returnDate` is null on a one-way; `route` names an end
+   * when the search had several places there ("to Porto", "from Detroit") or when one airport there didn't answer while the
+   * rest did ("from HOU", "into BAH").
    */
   dates: { outDate: string; returnDate: string | null; route?: string }[];
   /** Part of the date grid, or of the one-way prices by date, never came back. */

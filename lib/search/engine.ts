@@ -115,6 +115,12 @@ const STOP_AT = { pricing: 0.5, widening: 0.75, returns: 0.875 } as const;
 type Stage = keyof typeof STOP_AT;
 /** How long stays past three weeks can keep the first stage waiting once its other calls are done, never past its stop. */
 const LONG_STAYS_GRACE_MS = 4_000;
+/**
+ * How long a fare's flights home are asked for: one full ask (two 12 s attempts and the hedge, about 25 s), not the rest of
+ * the search. A fare whose return never answers keeps its price and links to the return choice. At most a quarter of the
+ * deadline.
+ */
+const RETURNS_WAIT_MS = 30_000;
 
 /** One origin × destination pair: airport codes to show (o, d) and query endpoints (oq, dq), which may be place ids. */
 export type Combo = { o: string; d: string; oq: string; dq: string };
@@ -185,9 +191,17 @@ export async function runSearch(
   const returning = askerFor("returns");
   // Stays past three weeks only add grid cells, and the provider answers them unreliably, so a miss isn't counted as a gap.
   const extra = askerFor("widening", true);
-  /** Lookups that never answered in time, for the note on the page (`Verdict.incomplete`). Dates are keyed by days and route. */
-  const gaps = { dates: new Map<string, { outDate: string; returnDate: string | null; o: string; d: string }>(), grid: false, other: 0 };
-  const unconfirmed = (outDate: string, returnDate: string | null, o: string, d: string) => gaps.dates.set(`${outDate}~${returnDate ?? ""}~${o}~${d}`, { outDate, returnDate, o, d });
+  /**
+   * Lookups that never answered in time, for the note on the page (`Verdict.incomplete`). Dates are keyed by days and route,
+   * and name the one airport that didn't answer when the others did (`from`, `into`).
+   */
+  type Gap = { outDate: string; returnDate: string | null; o: string; d: string; from?: string; into?: string };
+  const gaps = { dates: new Map<string, Gap>(), grid: false, other: 0 };
+  /** Keeps the first entry for a pair, so a later, vaguer one can't replace the airport it names. */
+  const unconfirmed = (outDate: string, returnDate: string | null, o: string, d: string, side: { from?: string; into?: string } = {}) => {
+    const key = `${outDate}~${returnDate ?? ""}~${o}~${d}`;
+    if (!gaps.dates.has(key)) gaps.dates.set(key, { outDate, returnDate, o, d, ...side });
+  };
   /** Counts an unanswered lookup as a gap and passes the answer through. */
   const counted = <T>(answer: T | null): T | null => {
     if (answer == null) gaps.other++;
@@ -317,6 +331,23 @@ export async function runSearch(
     const roundTrips = (ask: Asker, o: string, d: string, out: string, ret: string | null, what: string, shift: { out: number; ret: number }, attempts = 2, back?: string) =>
       Promise.all(roundTripCalls(o, d, out, ret, what, back).map((c) => shop(ask, c.input, c.what, shift, attempts)));
     /**
+     * The one airport that never answered in a round trip's calls (`roundTripCalls`): every miss used it and no answer did.
+     * Empty when nothing answered or the misses don't share an airport.
+     */
+    const missedAirport = (calls: { input: SearchInput }[], rs: unknown[]): { from?: string; into?: string } => {
+      if (!rs.some(Boolean)) return {};
+      const legs = (answered: boolean) => calls.filter((_, i) => Boolean(rs[i]) === answered).map((c) => c.input.flights[0]);
+      const only = (key: "from_airport" | "to_airport") => {
+        const missed = new Set(legs(false).map((l) => l[key]));
+        const [code] = missed;
+        return missed.size === 1 && !legs(true).some((l) => l[key] === code) ? code : null;
+      };
+      const from = only("from_airport");
+      if (from) return { from };
+      const into = only("to_airport");
+      return into ? { into } : {};
+    };
+    /**
      * Their own search, for when the grid also prices the asked dates. Returns each airport's call and answer, or null if any
      * call never answered. All or nothing, so a dearer airport's fares can't stand in for the dates on their own.
      */
@@ -352,7 +383,7 @@ export async function runSearch(
       const back = c.via?.back ?? to;
       const what = `dates ${c.outDate}${ret ? ` → ${ret}` : ""}${back !== to ? ` (back from ${back})` : combos.length > 1 ? ` to ${to}` : ""}`;
       return roundTrips(widening, from, to, c.outDate, ret, what, shift, attempts, back).then((rs) => {
-        if (!rs.every(Boolean)) unconfirmed(c.outDate, ret, from, to);
+        if (!rs.every(Boolean)) unconfirmed(c.outDate, ret, from, to, missedAirport(roundTripCalls(from, to, c.outDate, ret, what, back), rs));
         return rs;
       });
     };
@@ -488,7 +519,7 @@ export async function runSearch(
               if (rs.every(Boolean)) return noteBaseline(cheapestOf(rs), d);
               // Its fares are real and stay in the pool, but the cheapest of the airports that answered isn't a fair baseline.
               ownMissing.add(`${o}~${d}`);
-              unconfirmed(outDate, retDate, o, d);
+              unconfirmed(outDate, retDate, o, d, missedAirport(roundTripCalls(o, d, outDate, retDate, ownWhat(d)), rs));
             })
           );
       }
@@ -499,10 +530,11 @@ export async function runSearch(
         jobs.push(askShopping(pricing, bagless, "price insights").then((p) => void (got.bagless = counted(p))));
       }
       if (retDate) {
-        // Each direction as a one-way, for pairing across carriers (and across airports when mixing is allowed).
+        // Each direction as a one-way, for pairing across carriers (and across airports when mixing is allowed). One-ways only
+        // become plans as two tickets, so a miss is a gap only when two tickets are allowed.
         const keep = (list: IndexedItin[]) => (r: { added: IndexedItin[] } | null) => {
           if (r) list.push(...r.added);
-          else gaps.other++;
+          else if (plan.separateTickets) gaps.other++;
         };
         for (const { d, oq, dq } of combos) {
           jobs.push(shop(pricing, queryFor(req, oq, dq, outDate, null), `outbound to ${d} on its own`, { out: 0, ret: 0 }).then(keep(oneWays.out)));
@@ -899,6 +931,8 @@ export async function runSearch(
     const rtPicks = pickOutcome.picks.filter((p) => p.pair.out.rt && !p.pair.ret && !p.pair.out.jaw);
     if (rtPicks.length) {
       log(`Finding the return flight${rtPicks.length === 1 ? "" : "s"} for ${rtPicks.length === 1 ? "that fare" : "those fares"}…`, "action");
+      // Returns stop at `RETURNS_WAIT_MS` or at their stage's stop, whichever comes first.
+      stopTimers.push(setTimeout(() => stops.returns.abort(), Math.floor(Math.min(RETURNS_WAIT_MS, deadlineMs / 4))));
       // 12 s timeout, since a fare's first returns request can take ~9 s.
       const returnsOf = async (x: IndexedItin, back: string) => {
         const input = queryFor(req, x.itin.from, x.itin.to, x.itin.departure.slice(0, 10), back);
@@ -958,18 +992,22 @@ export async function runSearch(
     const gridCheaper = underPlans && !passedOver ? underPlans : null;
     if (underPlans)
       log(`The grid's cheapest days, ${underPlans.outDate}${retWin ? ` → ${underPlans.returnDate}` : ""} from ${fmt(underPlans.price)}, are not among the plans: ${underPlans.unconfirmed ? "they didn't answer in time" : underPlans.found == null ? "there were no flights on them when asked" : passedOver ? `a fare on them came back at ${fmt(underPlans.found)} and the picks passed it over` : `their flights came back from ${fmt(underPlans.found)}`}`, "info");
-    // Unanswered lookups, cheapest grid dates first. A route is named only when the search covered several.
+    // Unanswered lookups, cheapest grid dates first. A route names an end only when the search had several places there, or
+    // when one airport there didn't answer while the others did.
     const gridPriceOf = (out: string, ret: string | null) => gridView?.cells.find((c) => c.outDate === out && c.returnDate === (ret ?? out))?.price ?? Infinity;
-    const routeOf = (o: string, d: string) =>
-      origins.length > 1 && dests.length > 1 ? `${placeName(o)} to ${placeName(d)}` : origins.length > 1 ? `from ${placeName(o)}` : dests.length > 1 ? `to ${placeName(d)}` : null;
+    const routeOf = (g: Gap) => {
+      const from = g.from ?? (origins.length > 1 ? placeName(g.o) : null);
+      const to = g.into ? `into ${g.into}` : dests.length > 1 ? `to ${placeName(g.d)}` : null;
+      return [from && `from ${from}`, to].filter(Boolean).join(" ") || null;
+    };
     const incomplete: Incomplete | null =
       gaps.dates.size || gaps.grid || gaps.other
         ? {
             dates: [...gaps.dates.values()]
               .sort((a, b) => gridPriceOf(a.outDate, a.returnDate) - gridPriceOf(b.outDate, b.returnDate) || 0)
-              .map(({ outDate, returnDate, o, d }) => {
-                const route = routeOf(o, d);
-                return { outDate, returnDate, ...(route ? { route } : {}) };
+              .map((g) => {
+                const route = routeOf(g);
+                return { outDate: g.outDate, returnDate: g.returnDate, ...(route ? { route } : {}) };
               }),
             grid: gaps.grid,
             other: gaps.other,
