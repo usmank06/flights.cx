@@ -19,8 +19,8 @@ export const CALENDAR_ASKS = 4;
 export const AIRPORTS_PER_END = 3;
 /**
  * Timeout for each shopping request and its hedge. A cold long-haul search takes about 8 s, so this lets it answer on the
- * first ask. The provider keeps working after a request gives up, so a shorter timeout wouldn't get an answer any sooner.
- * A fare's first returns request takes about 9 s.
+ * first ask. The provider keeps working after a request gives up, so asking again gets an answer as soon as a longer timeout
+ * would. A fare's first returns request takes about 9 s and gets the same 12 s.
  */
 export const SHOPPING_TIMEOUT_MS = 12_000;
 
