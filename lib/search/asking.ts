@@ -126,14 +126,14 @@ export async function askCalendar(ask: Asker, what: string, call: ((opts: CallOp
 
 /**
  * Asks the live provider for fares through `ask`, with a fallback provider in reserve. The fallback starts as soon as the
- * live provider first asks again (its `onRetry`) and is used only when the live one never answers. With `checkEmpty`, a live
- * answer with no fares is checked against the fallback too, since a provider can answer "no flights" for a search it hasn't
- * finished. A miss the fallback covers is removed from `unanswered`.
+ * live provider first asks again (its `onRetry`) and is used when the live one never answers. A live answer with no fares is
+ * checked against the fallback too, since a provider can answer "no flights" for a search it hasn't finished, so empty is
+ * never final. A miss the fallback covers is removed from `unanswered`.
  */
 export function faresAsker(x: { backend: FlightBackend; fallback: FlightBackend | null | undefined; ask: Asker; spare: Asker | null; log?: Log; onFallback?: () => void }) {
   const { backend, fallback, ask, spare } = x;
   const log: Log = x.log ?? (() => {});
-  return async (input: SearchInput, what: string, o: { checkEmpty?: boolean } = {}): Promise<ShoppingPayload | null> => {
+  return async (input: SearchInput, what: string): Promise<ShoppingPayload | null> => {
     const can = Boolean(fallback && spare && (fallback.covers?.(input) ?? true));
     let reserve: Promise<ShoppingPayload | null> | null = null;
     const askSpare = () => (reserve ??= spare!.must((co) => fallback!.shopping(input, co), `${what} (${fallback!.name})`));
@@ -149,9 +149,12 @@ export function faresAsker(x: { backend: FlightBackend; fallback: FlightBackend 
       what
     );
     if (!can) return live;
-    if (live?.itineraries.length || (live && !o.checkEmpty)) return live;
+    if (live?.itineraries.length) return live;
     const other = await (reserve ?? askSpare());
-    if (!other?.itineraries.length) return live;
+    if (!other?.itineraries.length) {
+      log(`  ${what}: ${fallback!.name} ${other ? "has no fares either" : "didn't answer either"}`, "info");
+      return live;
+    }
     if (live) log(`  ${what}: ${backend.name} has no fares, ${fallback!.name} has ${other.itineraries.length}`, "info");
     else {
       ask.covered(what);

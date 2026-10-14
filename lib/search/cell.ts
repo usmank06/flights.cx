@@ -43,8 +43,7 @@ export async function flightsForCell(opts: {
   );
   asking.allAnswered();
   const endpointOf = (code: string) => ends.get(code)?.q ?? code;
-  // The call between the cell's own airports is checked against the fallback when it comes back empty.
-  const shopping = (input: ReturnType<typeof queryFor>) => fares(input, describeInput(input), { checkEmpty: input.flights[0].from_airport === from && input.flights[0].to_airport === to });
+  const shopping = (input: ReturnType<typeof queryFor>) => fares(input, describeInput(input));
 
   if (ask.tickets === "two" && returnDate) {
     const inputOut = queryFor(req, endpointOf(from), endpointOf(to), outDate, null);

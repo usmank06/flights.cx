@@ -237,12 +237,12 @@ export async function runSearch(
      */
     /** Asks one fares call through a stage's asker, with the fallback provider in reserve (`faresAsker`, asking.ts). */
     const shoppers = new Map<Asker, ReturnType<typeof faresAsker>>();
-    const askShopping = (ask: Asker, input: SearchInput, what: string, checkEmpty = false) => {
+    const askShopping = (ask: Asker, input: SearchInput, what: string) => {
       let shopper = shoppers.get(ask);
       if (!shopper) shoppers.set(ask, (shopper = faresAsker({ backend, fallback, ask, spare: spares.get(ask) ?? null, log, onFallback: () => fallbacks++ })));
-      return shopper(input, what, { checkEmpty });
+      return shopper(input, what);
     };
-    /** The call between the two places' own airports. It's the one checked against the fallback when it comes back empty. */
+    /** The call between the two places' own airports. */
     const isMain = (input: SearchInput, o: string, d: string) => input.flights[0].from_airport === o && input.flights[0].to_airport === d;
     /** Adds an answer's fares to the pool. */
     const take = (payload: ShoppingPayload, input: SearchInput, what: string, shift?: { out: number; ret: number }) => {
@@ -252,8 +252,8 @@ export async function runSearch(
       log(`  ${describeInput(input)} → ${payload.itineraries.length} itineraries${Number.isFinite(cheapest) ? ` from ${fmt(cheapest)}` : ""} — ${what}${payload.provider ? ` (${payload.provider})` : ""}`, "info");
       return { payload, added };
     };
-    const shop = (ask: Asker, input: SearchInput, what: string, shift?: { out: number; ret: number }, checkEmpty = false) =>
-      askShopping(ask, input, what, checkEmpty).then((payload) => (payload ? take(payload, input, what, shift) : null));
+    const shop = (ask: Asker, input: SearchInput, what: string, shift?: { out: number; ret: number }) =>
+      askShopping(ask, input, what).then((payload) => (payload ? take(payload, input, what, shift) : null));
 
     // An object rather than `let`s: the payloads are assigned in callbacks, and narrowing would treat a `let` as always null.
     const got: { baseline: ShoppingPayload | null; bagless: ShoppingPayload | null } = { baseline: null, bagless: null };
@@ -348,9 +348,9 @@ export async function runSearch(
         (back && back !== d ? [d] : airportsOf(d)).map((t) => ({ input: queryFor(req, f, t, out, ret, "", back && back !== d ? back : undefined), what: `${what}${f !== o ? ` from ${f}` : ""}${t !== d ? ` into ${t}` : ""}` }))
       );
     /** Buys one round trip, a call per airport pair at both ends. */
-    /** Buys one round trip, a call per airport pair at both ends. `own`: their own search, whose main call is checked when empty. */
-    const roundTrips = (ask: Asker, o: string, d: string, out: string, ret: string | null, what: string, shift: { out: number; ret: number }, back?: string, own = false) =>
-      Promise.all(roundTripCalls(o, d, out, ret, what, back).map((c) => shop(ask, c.input, c.what, shift, own && isMain(c.input, o, d))));
+    /** Buys one round trip, a call per airport pair at both ends. */
+    const roundTrips = (ask: Asker, o: string, d: string, out: string, ret: string | null, what: string, shift: { out: number; ret: number }, back?: string) =>
+      Promise.all(roundTripCalls(o, d, out, ret, what, back).map((c) => shop(ask, c.input, c.what, shift)));
     /**
      * The one airport that never answered in a round trip's calls (`roundTripCalls`): every miss used it and no answer did.
      * Empty when nothing answered or the misses don't share an airport.
@@ -369,13 +369,14 @@ export async function runSearch(
       return into ? { into } : {};
     };
     /**
-     * Their own search, for when the grid also prices the asked dates. Returns each airport's call and answer, or null if any
-     * call never answered. All or nothing, so a dearer airport's fares can't stand in for the dates on their own.
+     * Their own search, for when the grid also prices the asked dates. Returns each airport's call and answer, with null where
+     * it never answered. The caller keeps the fares when the main pair answered, and compares against them only when every
+     * airport did. If the main pair never answered, none are kept, so a dearer airport's fares can't stand in for the dates.
      */
     const ownSearch = async (o: string, d: string, what: string) => {
       const calls = roundTripCalls(o, d, outDate, retDate, what);
-      const answers = await Promise.all(calls.map((c) => askShopping(pricing, c.input, c.what, isMain(c.input, o, d))));
-      return answers.every(Boolean) ? calls.map((c, i) => ({ ...c, payload: answers[i]! })) : null;
+      const answers = await Promise.all(calls.map((c) => askShopping(pricing, c.input, c.what)));
+      return { calls, answers };
     };
     /** Of the answers for one trip from several airports, the one with the cheapest fare. */
     const cheapestOf = (rs: ({ payload: ShoppingPayload } | null)[]): ShoppingPayload | null => {
@@ -530,14 +531,19 @@ export async function runSearch(
       for (const { o, d } of combos) {
         if (ownOptional && o === from)
           jobs.push(
-            ownSearch(o, d, ownWhat(d)).then((calls) => {
-              if (!calls) return void ownUnanswered.add(d);
-              noteBaseline(cheapestOf(calls.map((c) => take(c.payload, c.input, c.what, { out: 0, ret: 0 }))), d);
+            ownSearch(o, d, ownWhat(d)).then(({ calls, answers }) => {
+              // Every fare that came back is kept. With an airport unanswered, the cheapest of the rest isn't a fair baseline, and with
+              // the main pair unanswered, widening buys the asked dates again.
+              const got = calls.map((c, i) => (answers[i] ? take(answers[i]!, c.input, c.what, { out: 0, ret: 0 }) : null));
+              if (answers.every(Boolean)) return noteBaseline(cheapestOf(got), d);
+              if (answers[calls.findIndex((c) => isMain(c.input, o, d))]) ownMissing.add(`${o}~${d}`);
+              else ownUnanswered.add(d);
+              unconfirmed(outDate, retDate, o, d, missedAirport(calls, answers));
             })
           );
         else
           jobs.push(
-            roundTrips(pricing, o, d, outDate, retDate, ownWhat(d), { out: 0, ret: 0 }, undefined, true).then((rs) => {
+            roundTrips(pricing, o, d, outDate, retDate, ownWhat(d), { out: 0, ret: 0 }).then((rs) => {
               if (rs.every(Boolean)) return noteBaseline(cheapestOf(rs), d);
               // Its fares are real and stay in the pool, but the cheapest of the airports that answered isn't a fair baseline.
               ownMissing.add(`${o}~${d}`);
@@ -559,8 +565,8 @@ export async function runSearch(
           else if (plan.separateTickets) gaps.other++;
         };
         for (const { d, oq, dq } of combos) {
-          jobs.push(shop(pricing, queryFor(req, oq, dq, outDate, null), `outbound to ${d} on its own`, { out: 0, ret: 0 }, true).then(keep(oneWays.out)));
-          jobs.push(shop(pricing, queryFor(req, dq, oq, retDate, null), `return from ${d} on its own`, { out: 0, ret: 0 }, true).then(keep(oneWays.ret)));
+          jobs.push(shop(pricing, queryFor(req, oq, dq, outDate, null), `outbound to ${d} on its own`, { out: 0, ret: 0 }).then(keep(oneWays.out)));
+          jobs.push(shop(pricing, queryFor(req, dq, oq, retDate, null), `return from ${d} on its own`, { out: 0, ret: 0 }).then(keep(oneWays.ret)));
         }
       }
       if (flexible && retWin) {
@@ -604,18 +610,49 @@ export async function runSearch(
         await Promise.race([Promise.allSettled(longJobs), cutoff]);
         clearTimeout(timer);
       }
+      // If no round-trip fare on their dates came back and some call never answered, the later stages have nothing to work
+      // with. Their time goes to asking again instead, until 24 s before the deadline. The provider answers a re-ask once it has
+      // finished, and the fallback stays in reserve. A call that answers now is no longer a gap.
+      if (!open && pool.roundTripFloor == null && pricing.unanswered.length && left() > 40_000) {
+        const budget = Math.floor(left() - 24_000);
+        log(`Nothing came back for your dates yet, so asking again with the time that's left (${Math.round(budget / 1000)} s)…`, "action");
+        const signal = AbortSignal.any([killer.signal, AbortSignal.timeout(budget)]);
+        const again = asker({ signal, log, onAsk: () => queries++ });
+        spares.set(again, fallback ? asker({ signal, log, onAsk: () => queries++, bestEffort: true }) : null);
+        await Promise.allSettled(
+          combos.map(async ({ o, d, oq, dq }) => {
+            const calls = roundTripCalls(o, d, outDate, retDate, ownWhat(d));
+            const [rs] = await Promise.all([
+              Promise.all(calls.map((c) => shop(again, c.input, c.what, { out: 0, ret: 0 }).then((r) => (r && pricing.covered(c.what), r)))),
+              ...(retDate
+                ? [
+                    shop(again, queryFor(req, oq, dq, outDate, null), `outbound to ${d} on its own`, { out: 0, ret: 0 }).then((r) => r && pricing.covered(`outbound to ${d} on its own`)),
+                    shop(again, queryFor(req, dq, oq, retDate, null), `return from ${d} on its own`, { out: 0, ret: 0 }).then((r) => r && pricing.covered(`return from ${d} on its own`)),
+                  ]
+                : []),
+            ]);
+            if (!rs.every(Boolean)) return;
+            // Every airport answered this time, so their own search is the baseline and its dates aren't a gap.
+            ownUnanswered.delete(d);
+            ownMissing.delete(`${o}~${d}`);
+            for (const key of [...gaps.dates.keys()]) if (key.startsWith(`${outDate}~${retDate ?? ""}~${o}~${d}`)) gaps.dates.delete(key);
+            noteBaseline(cheapestOf(rs), d);
+          })
+        );
+        if (pool.roundTripFloor != null) log(`Asked again, their dates answered: ${pool.size} itineraries in hand`, "success");
+      }
       // An own search that didn't answer leaves its dates to the grid's price and to widening.
       for (const d of ownUnanswered) {
         const what = ownWhat(d);
         const priced = grids.some((g) => g.d === d && g.cells.has(cellKey(outDate, retDate ?? "")));
-        log(`${what.charAt(0).toUpperCase()}${what.slice(1)} didn't answer from every airport in time, so none of it is kept${priced ? "; the grid prices those dates" : ", and the grid has no price for those dates"}`, "info");
+        log(`${what.charAt(0).toUpperCase()}${what.slice(1)} didn't answer from its main airports in time; what came back is kept, nothing is compared against it${priced ? ", and the grid prices those dates" : ", and the grid has no price for those dates"}`, "info");
       }
       if (pool.baseline != null && !ownUnanswered.size && !ownMissing.size) log(`Your own search comes to ${fmt(pool.baseline)}${combos.length > 1 ? ` at best, across ${combos.length} searches` : ""}${got.baseline?.provider ? `, from ${got.baseline.provider}` : ""}`, "success");
       const ins = withInsights()?.insights;
       if (ins?.level) log(`Prices for this trip are currently ${ins.level}`, "info");
       const asked = (codes: string[]) => [...new Set(codes.flatMap(airportsOf))].join("/");
       notes.push(`Priced the trip as asked${combos.length > 1 ? ` to ${combos.length} places` : ""}, round trips from ${asked(origins)} to ${asked(dests)}${retDate ? ", both directions on their own" : ""}${grids.length ? `, ${grids.length} price grid${grids.length > 1 ? "s" : ""}` : ""}${graphsOut.size ? `, ${graphsOut.size + graphsBack.size} one-way price graphs` : ""}`);
-      if (ownUnanswered.size) notes.push(`The round trip on their own dates${combos.length > 1 ? ` to ${[...ownUnanswered].join(" and ")}` : ""} didn't answer from every airport in time, so none of its fares were kept; the grid priced those dates`);
+      if (ownUnanswered.size) notes.push(`The round trip on their own dates${combos.length > 1 ? ` to ${[...ownUnanswered].join(" and ")}` : ""} didn't answer from its main airports in time; what came back is kept, nothing is compared against it, and the cheapest dates were bought again`);
       if (ownMissing.size) notes.push(`The round trip on their own dates${combos.length > 1 ? ` (${[...ownMissing].map((k) => k.replace("~", " to ")).join(", ")})` : ""} didn't answer from every airport in time, so it isn't compared against`);
     }
 
@@ -640,6 +677,21 @@ export async function runSearch(
           if (okFrom.has(a.code) || [...knownPlaces.values()].some((k) => k.airports.has(a.code) || k.name === a.city)) continue;
           knownPlaces.set(a.code, { code: a.code, name: a.city, country: countryName(a.country), endpoint: a.code, airports: metroCodes(a.code).size ? metroCodes(a.code) : new Set([a.code]), listedPrice: null, source: "asked" });
         }
+      // For a named country with no airport in the table (Mauritius, the Maldives, Costa Rica), the provider's place lookup
+      // knows its cities and airports, and the first of those stand in for the table's gateways.
+      if (area && !knownPlaces.size && area.countries.size && backend.places) {
+        for (const country of [...area.countries].slice(0, AREA_SEEDS)) {
+          const name = countryName(country);
+          if (!name) continue;
+          const hits = counted(await widening.must((co) => backend.places!(name, co), `places in ${name}`));
+          for (const h of (hits ?? []).filter((h) => h.code || h.airports.length).slice(0, AREA_SEEDS)) {
+            const code = h.code ?? h.airports[0]?.code;
+            if (!code || knownPlaces.has(code) || okFrom.has(code)) continue;
+            knownPlaces.set(code, { code, name: h.name.replace(/,.*$/, ""), country: name, endpoint: h.id || code, airports: new Set(h.airports.length ? h.airports.map((a) => a.code) : [code]), listedPrice: null, source: "asked" });
+          }
+        }
+        log(knownPlaces.size ? `${area.label} isn't in the airport table, so the provider's lookup chose ${[...knownPlaces.values()].map((k) => k.name).join(", ")}` : `${area.label} isn't in the airport table, and the provider's lookup found nothing there`, "info");
+      }
       for (const k of knownPlaces.values()) if (isPlaceId(k.endpoint)) PLACE_NAMES.set(k.endpoint, k.name);
       const month = new Date(`${outDate}T12:00:00Z`).toLocaleDateString("en-US", { month: "long", timeZone: "UTC" });
       // Round trips to a place go by airport code, as in `roundTrips`: a grouped place's own airports, else nearby ones.
