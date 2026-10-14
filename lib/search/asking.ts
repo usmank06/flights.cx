@@ -1,28 +1,18 @@
 import { AIRPORTS, nearbyAirports } from "@/lib/airports";
-import { isPlaceId, type FlightBackend } from "@/lib/flights/backend";
-import { FlightsError } from "@/lib/flights/errors";
-import type { DatePricePoint } from "@/lib/flights/types";
+import { isPlaceId, type Calendar, type CallOptions, type FlightBackend } from "@/lib/flights/backend";
+import { asFlightsError } from "@/lib/flights/retry";
+import type { DatePricePoint, SearchInput, ShoppingPayload } from "@/lib/flights/types";
 import { PLACE_NAMES } from "./core";
 import { metroCodes } from "./intake";
 
 /**
- * Retries provider calls until they answer or the caller's signal stops them. Unanswered calls are recorded. A search
- * continues without them and says so; a grid cell's flights, the chat's grid and a follow-up end with an error instead.
+ * Makes provider calls under a clock and records the ones that never answered. A search continues without them and says
+ * so. A grid cell's flights, the chat's grid and a follow-up end with an error instead. Retrying happens inside the provider
+ * (lib/flights/retry.ts), so each call is made once here and given the clock.
  */
 
-/** Attempts per call before it counts as unanswered (`must`), and the base pause between attempts, which grows each time. */
-export const ASKS = 4;
-export const ASK_AGAIN_MS = 600;
-/** Asks of an incomplete calendar before it counts as unanswered (`settleCalendar`). */
-export const CALENDAR_ASKS = 4;
 /** Airports asked per end of a round trip: the place's own plus grouped or nearby ones. */
 export const AIRPORTS_PER_END = 3;
-/**
- * Timeout for each shopping request and its hedge. A cold long-haul search takes about 8 s, so this lets it answer on the
- * first ask. The provider keeps working after a request gives up, so asking again gets an answer as soon as a longer timeout
- * would. A fare's first returns request takes about 9 s and gets the same 12 s.
- */
-export const SHOPPING_TIMEOUT_MS = 12_000;
 
 /** Thrown when calls never answered, so nothing is built from partial answers. */
 export class Unanswered extends Error {
@@ -35,11 +25,13 @@ export class Unanswered extends Error {
 type Log = (text: string, kind?: "info" | "action" | "success" | "error") => void;
 
 export type Asker = {
-  /** Runs one provider call until it answers. Returns null if it never does, and records it in `unanswered`. */
-  must: <T>(fn: (signal: AbortSignal) => Promise<T>, what: string) => Promise<T | null>;
-  /** Asks a calendar until it is complete (see below). Returns false if it never answered or never stopped changing. */
-  settleCalendar: (what: string, call: (signal: AbortSignal, enough?: number) => Promise<DatePricePoint[]>, expected: number, onAnswer: (pts: DatePricePoint[]) => void, counts?: (p: DatePricePoint) => boolean) => Promise<boolean>;
-  /** A pause the caller's deadline cuts short. */
+  /** Makes one provider call with the clock. Returns null if it never answers, and records it in `unanswered`. */
+  must: <T>(fn: (opts: CallOptions) => Promise<T>, what: string) => Promise<T | null>;
+  /** Records a call that answered short of what was asked (a calendar that never settled) as a miss. */
+  record: (what: string) => void;
+  /** Removes a recorded miss when another source answered it. */
+  covered: (what: string) => void;
+  /** A pause the clock cuts short. */
   pause: (ms: number) => Promise<void>;
   /** Calls that never answered, in the order they gave up. */
   readonly unanswered: string[];
@@ -49,8 +41,8 @@ export type Asker = {
 
 /**
  * `signal` is the only clock for every call: the caller's deadline, or when a search stage stops waiting. `onAsk` counts each
- * attempt for stats. With `bestEffort`, misses are logged but not recorded as unanswered (for optional extras such as
- * long-stay grid cells).
+ * request the provider sends, for stats. With `bestEffort`, misses are logged but not recorded as unanswered (for optional
+ * extras such as long-stay grid cells).
  */
 export function asker(opts: { signal: AbortSignal; log?: Log; onAsk?: () => void; bestEffort?: boolean }): Asker {
   const { signal } = opts;
@@ -60,6 +52,8 @@ export function asker(opts: { signal: AbortSignal; log?: Log; onAsk?: () => void
     if (!opts.bestEffort) unanswered.push(what);
   };
   const missKind = opts.bestEffort ? "info" : "error";
+  const cap = (t: string) => t.charAt(0).toUpperCase() + t.slice(1);
+  const without = opts.bestEffort ? " — going on without it" : "";
 
   const pause = (ms: number) =>
     new Promise<void>((done) => {
@@ -68,64 +62,103 @@ export function asker(opts: { signal: AbortSignal; log?: Log; onAsk?: () => void
       signal.addEventListener("abort", stop, { once: true });
     });
 
-  const must = async <T>(fn: (signal: AbortSignal) => Promise<T>, what: string): Promise<T | null> => {
-    for (let ask = 1; ask <= ASKS && !signal.aborted; ask++) {
+  const must = async <T>(fn: (opts: CallOptions) => Promise<T>, what: string): Promise<T | null> => {
+    if (!signal.aborted) {
       try {
-        opts.onAsk?.();
-        return await fn(signal);
+        return await fn({
+          signal,
+          onAsk: opts.onAsk,
+          onRetry: (why) => log(`  ${what} ✗ ${why.kind}: ${why.message.slice(0, 160)} — asking again`, missKind),
+          note: (text) => log(`${cap(what)}: ${text}`, "info"),
+        });
       } catch (e) {
-        if (signal.aborted) break;
-        const err = e instanceof FlightsError ? e : new FlightsError("HTTP_ERROR", (e as Error).message);
-        log(`  ${what} ✗ ${err.kind}: ${err.message.slice(0, 160)}${ask < ASKS ? " — asking again" : ""}`, missKind);
-        // No pause after the last ask; it would only delay the stage waiting on this call.
-        if (ask < ASKS) await pause(ASK_AGAIN_MS * ask);
+        if (!signal.aborted) {
+          missed(what);
+          log(`  ${what}: ${asFlightsError(e).message.slice(0, 200)}${without}`, missKind);
+          return null;
+        }
       }
     }
     missed(what);
-    log(`  ${what}: no answer ${signal.aborted ? "in time" : `after ${ASKS} asks`}${opts.bestEffort ? " — going on without it" : ""}`, missKind);
+    log(`  ${what}: no answer in time${without}`, missKind);
     return null;
-  };
-
-  const cap = (t: string) => t.charAt(0).toUpperCase() + t.slice(1);
-  /**
-   * Asks a calendar until every day is priced or a repeat ask adds nothing, since the provider omits days it won't price.
-   * Still changing after CALENDAR_ASKS means unanswered. A mostly full calendar is re-asked with the cheaper `enough`.
-   * `counts` limits what counts toward `expected` (a grid: stays up to GRID_MAX_STAY); `onAnswer` still gets every point.
-   */
-  const settleCalendar: Asker["settleCalendar"] = async (what, call, expected, onAnswer, counts) => {
-    const held = new Set<string>();
-    for (let ask = 1; ; ask++) {
-      const enough = ask > 1 && held.size >= expected * 0.6 ? held.size : undefined;
-      const pts = await must((s) => call(s, enough), ask > 1 ? `${what}, ask ${ask}` : what);
-      if (!pts) return false; // unanswered, already recorded
-      const fresh = new Set(pts.filter((p) => p.price != null && (!p.returnDate || p.returnDate > p.outDate) && (!counts || counts(p))).map((p) => `${p.outDate}~${p.returnDate ?? ""}`));
-      const added = [...fresh].filter((k) => !held.has(k)).length;
-      const covers = fresh.size >= held.size * 0.9;
-      for (const k of fresh) held.add(k);
-      onAnswer(pts);
-      if (held.size >= expected) return true;
-      if (ask > 1 && !added && covers) {
-        log(`${cap(what)}: ${held.size} of ${expected}, and nothing new when asked again, so that's all of it`, "info");
-        return true;
-      }
-      if (ask >= CALENDAR_ASKS) {
-        missed(`${what}, still changing after ${CALENDAR_ASKS} asks`);
-        log(`${cap(what)}: ${held.size} of ${expected}, still changing after ${CALENDAR_ASKS} asks${opts.bestEffort ? " — keeping what came back" : ""}`, missKind);
-        return false;
-      }
-      log(`${cap(what)}: ${held.size} of ${expected}, asking again to make sure that's all`, "info");
-      await pause(ASK_AGAIN_MS);
-    }
   };
 
   return {
     must,
-    settleCalendar,
+    record: missed,
+    covered: (what) => {
+      const i = unanswered.indexOf(what);
+      if (i >= 0) unanswered.splice(i, 1);
+    },
     pause,
     unanswered,
     allAnswered: () => {
       if (unanswered.length) throw new Unanswered([...unanswered]);
     },
+  };
+}
+
+/**
+ * Asks a calendar through `ask`, passing what it holds to `take` as it fills in. Returns false when it never answered or
+ * never settled, which counts as a miss. Returns true when the provider has no such calendar, since a feature that's off
+ * isn't a gap.
+ */
+export async function askCalendar(ask: Asker, what: string, call: ((opts: CallOptions) => Promise<Calendar>) | null, take: (pts: DatePricePoint[]) => void): Promise<boolean> {
+  if (!call) return true;
+  let handed = false;
+  const cal = await ask.must(
+    (o) =>
+      call({
+        ...o,
+        onProgress: (pts) => {
+          handed = true;
+          take(pts);
+        },
+      }),
+    what
+  );
+  if (!cal) return false;
+  if (!handed) take(cal.points);
+  if (!cal.settled) ask.record(`${what}, still changing when the provider stopped asking`);
+  return cal.settled;
+}
+
+/**
+ * Asks the live provider for fares through `ask`, with a fallback provider in reserve. The fallback starts as soon as the
+ * live provider first asks again (its `onRetry`) and is used only when the live one never answers. With `checkEmpty`, a live
+ * answer with no fares is checked against the fallback too, since a provider can answer "no flights" for a search it hasn't
+ * finished. A miss the fallback covers is removed from `unanswered`.
+ */
+export function faresAsker(x: { backend: FlightBackend; fallback: FlightBackend | null | undefined; ask: Asker; spare: Asker | null; log?: Log; onFallback?: () => void }) {
+  const { backend, fallback, ask, spare } = x;
+  const log: Log = x.log ?? (() => {});
+  return async (input: SearchInput, what: string, o: { checkEmpty?: boolean } = {}): Promise<ShoppingPayload | null> => {
+    const can = Boolean(fallback && spare && (fallback.covers?.(input) ?? true));
+    let reserve: Promise<ShoppingPayload | null> | null = null;
+    const askSpare = () => (reserve ??= spare!.must((co) => fallback!.shopping(input, co), `${what} (${fallback!.name})`));
+    const live = await ask.must(
+      (co) =>
+        backend.shopping(input, {
+          ...co,
+          onRetry: (why) => {
+            co.onRetry?.(why);
+            if (can) askSpare();
+          },
+        }),
+      what
+    );
+    if (!can) return live;
+    if (live?.itineraries.length || (live && !o.checkEmpty)) return live;
+    const other = await (reserve ?? askSpare());
+    if (!other?.itineraries.length) return live;
+    if (live) log(`  ${what}: ${backend.name} has no fares, ${fallback!.name} has ${other.itineraries.length}`, "info");
+    else {
+      ask.covered(what);
+      log(`  ${what}: answered by ${fallback!.name} instead, ${other.itineraries.length} fares`, "info");
+    }
+    x.onFallback?.();
+    return other;
   };
 }
 
@@ -143,24 +176,31 @@ function cacheFor(backend: FlightBackend): Map<string, Endpoint> {
   if (!cache) ENDPOINT_CACHES.set(backend, (cache = new Map()));
   return cache;
 }
+/** The airports a place id covers, for a provider that doesn't know the id (the fallback). */
+const PLACE_AIRPORTS = new Map<string, string[]>();
+export const airportsOfPlace = (id: string): string[] | null => PLACE_AIRPORTS.get(id) ?? null;
 
 /**
  * Resolves a place to a query endpoint. A city grouping several airports becomes a place id that prices them all in one call;
- * anything else stays the airport code. An unanswered lookup falls back to the code and isn't cached.
+ * anything else stays the airport code. An unanswered lookup, or a provider without one, falls back to the code and isn't cached.
  */
 export async function resolveEndpoint(backend: FlightBackend, must: Asker["must"], place: { code: string; name: string }): Promise<Endpoint> {
   const fallback = { q: place.code, airports: metroCodes(place.code) };
+  if (!backend.places) return fallback;
   // Look up the table's city name, since a full airport name resolves to that airport alone.
   const name = AIRPORTS[place.code]?.city ?? place.name;
   const key = `${place.code}~${name.trim().toLowerCase()}`;
   const cache = cacheFor(backend);
   const cached = cache.get(key);
   if (cached) return cached;
-  const hits = await must((signal) => backend.places(name, { signal, timeoutMs: 5_000 }), `places for ${name}`);
+  const hits = await must((o) => backend.places!(name, o), `places for ${name}`);
   if (!hits) return fallback;
   const hit = hits.find((h) => h.kind === "city" && h.airports.length >= 2 && h.airports.some((a) => a.code === place.code));
   const resolved = hit ? { q: hit.id, airports: new Set(hit.airports.map((a) => a.code)) } : fallback;
-  if (hit) PLACE_NAMES.set(hit.id, name);
+  if (hit) {
+    PLACE_NAMES.set(hit.id, name);
+    PLACE_AIRPORTS.set(hit.id, hit.airports.map((a) => a.code));
+  }
   cache.set(key, resolved);
   return resolved;
 }

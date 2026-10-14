@@ -128,7 +128,7 @@ export function PlanCard({
   const { text: line } = splitRouteNote(plan.summary);
   const tags: { tone: "good" | "quiet" | "warn"; text: string }[] = [
     ...(isCheapest && saved != null && saved > 0 ? [{ tone: "good" as const, text: `${money(saved, plan.currency, locale)} under your dates` }] : []),
-    ...cautions(plan, named).map((c) => ({ tone: c === "2 tickets" ? ("quiet" as const) : ("warn" as const), text: c })),
+    ...cautions(plan, named).map((c) => ({ tone: c === "2 tickets" || /\bvia /.test(c) ? ("quiet" as const) : ("warn" as const), text: c })),
   ];
 
   const detailsClass =

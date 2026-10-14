@@ -101,6 +101,10 @@ export interface Itinerary {
   checkedIncluded?: number | null;
   /** Sold as two separate tickets, so a single booking link can't buy it. */
   separateTickets?: true;
+  /** The provider the fare came from when it isn't the live one, named as the page shows it. */
+  provider?: string;
+  /** That provider's own link for booking this fare, as its ticket. */
+  bookingUrl?: string | null;
 }
 
 /** How today's price compares with the usual range for the route. */
@@ -149,6 +153,8 @@ export interface ShoppingPayload {
   insights: PriceInsights | null;
   dateHints: DateHint[];
   airportHints: AirportHint[];
+  /** The answering provider's name, when it isn't the live one. */
+  provider?: string;
 }
 
 /** One cell of a date grid, or one day of a price graph. */

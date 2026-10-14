@@ -170,7 +170,8 @@ export function cautions(plan: FlightPlan, named?: Named | null): string[] {
     : routeTags(splitRouteNote(plan.summary).note).map((t) => t.replace(/, not .*$/, "").replace("Leaves from", "From").replace("Lands at", "Into"));
   const hours = (dur: string) => Number(dur.match(/(\d+)h/)?.[1] ?? 0);
   const longest = plan.legs.flatMap(layovers).sort((a, b) => hours(b.dur) - hours(a.dur))[0];
-  return [...route, ...(longest && hours(longest.dur) >= 4 ? [`${hours(longest.dur)}h layover`] : []), ...(plan.booking.returnUrl ? ["2 tickets"] : [])];
+  const site = plan.booking.site ? [`via ${plan.booking.site}`] : plan.booking.returnSite ? [`ticket 2 via ${plan.booking.returnSite}`] : [];
+  return [...route, ...(longest && hours(longest.dur) >= 4 ? [`${hours(longest.dur)}h layover`] : []), ...(plan.booking.returnUrl ? ["2 tickets"] : []), ...site];
 }
 
 /**

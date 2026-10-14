@@ -324,6 +324,9 @@ export type CompactRow = {
   seg: string[];
   /** The provider's opaque booking token, when present. Never sent to a model. */
   bookingToken?: string | null;
+  /** On a fare from a provider other than the live one, its name and booking link. Never sent to a model. */
+  provider?: string;
+  bookingUrl?: string;
   carryOn?: number | null;
 };
 
@@ -348,17 +351,20 @@ export function compactForLLM(x: IndexedItin): CompactRow {
     fn: it.segments.map((s) => `${s.airlineCode ?? "?"} ${s.flightNumber ?? "?"}`),
     seg: it.segments.map((s) => `${s.from.code} ${s.departure.slice(0, 10)} ${s.to.code} ${s.airlineCode ?? "?"} ${s.flightNumber ?? "?"}`),
     ...(it.bookingToken ? { bookingToken: it.bookingToken } : {}),
+    ...(it.provider && it.bookingUrl ? { provider: it.provider, bookingUrl: it.bookingUrl } : {}),
     ...(it.carryOnIncluded != null ? { carryOn: it.carryOnIncluded } : {}),
   };
 }
 
 /** A row as a model sees it, without the booking fields. */
-export type ModelRow = Omit<CompactRow, "seg" | "bookingToken">;
+export type ModelRow = Omit<CompactRow, "seg" | "bookingToken" | "provider" | "bookingUrl">;
 export const rowsForModel = (rows: CompactRow[]): ModelRow[] =>
   rows.map((row) => {
-    const rest: ModelRow & Partial<Pick<CompactRow, "seg" | "bookingToken">> = { ...row };
+    const rest: ModelRow & Partial<Pick<CompactRow, "seg" | "bookingToken" | "provider" | "bookingUrl">> = { ...row };
     delete rest.bookingToken;
     delete rest.seg;
+    delete rest.provider;
+    delete rest.bookingUrl;
     return rest;
   });
 

@@ -189,7 +189,7 @@ export function planFacts(plan: FlightPlan, cheapest?: number, asked?: { out: st
   const money_ = money(plan.price, plan.currency);
   const against = cheapest == null ? "" : plan.price === cheapest ? " (the cheapest plan)" : ` (${money(plan.price - cheapest, plan.currency)} more than the cheapest plan)`;
   const shift = asked ? shiftOf(plan, asked) : (plan.dateShift ?? { out: 0, ret: 0 });
-  return `${plan.id} "${plan.label}": ${money_}${against}${plan.travellers && plan.travellers > 1 ? ` total for ${plan.travellers}` : ""}; ${plan.roundTripFare ? `one round-trip ticket, back ${plan.returnDate ?? "?"}` : plan.booking?.returnUrl ? "two separate tickets" : "one ticket"}; ${legs}; dates: ${shiftWords(shift, Boolean(asked?.ret ?? plan.legs.some((l) => l.direction === "return")))}${plan.scores ? `; hassle ${plan.scores.hassle}/100, hours ${plan.scores.hours}/100` : ""}`;
+  return `${plan.id} "${plan.label}": ${money_}${against}${plan.travellers && plan.travellers > 1 ? ` total for ${plan.travellers}` : ""}; ${plan.roundTripFare ? `one round-trip ticket, back ${plan.returnDate ?? "?"}` : plan.booking?.returnUrl ? "two separate tickets" : "one ticket"}${plan.booking?.site ? ` sold by ${plan.booking.site}, not by the airline` : ""}; ${legs}; dates: ${shiftWords(shift, Boolean(asked?.ret ?? plan.legs.some((l) => l.direction === "return")))}${plan.scores ? `; hassle ${plan.scores.hassle}/100, hours ${plan.scores.hours}/100` : ""}`;
 }
 
 /** The write-up's user prompt: trip facts, formatted prices and date shifts in code's words. */

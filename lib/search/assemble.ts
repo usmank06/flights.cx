@@ -99,11 +99,13 @@ function bookingForRow(
     retDate?: string | null;
     backFrom?: string;
     bookingToken?: string | null;
+    provider?: string;
+    bookingUrl?: string;
   },
-  ret: { from: string; to: string; dep: string; stops: number; lay: string[]; fn: string[]; seg: string[] } | undefined,
+  ret: { from: string; to: string; dep: string; stops: number; lay: string[]; fn: string[]; seg: string[]; provider?: string; bookingUrl?: string } | undefined,
   ctx: BookingContext
 ): PlanBooking {
-  const toItin = (r: { from: string; to: string; dep: string; stops: number; lay: string[]; fn: string[]; seg: string[] }): Itinerary => {
+  const toItin = (r: { from: string; to: string; dep: string; stops: number; lay: string[]; fn: string[]; seg: string[]; provider?: string; bookingUrl?: string }): Itinerary => {
     // Row digest formats: `lay` is "ORD 145m", `seg` is "ORD YYYY-MM-DD DOH QR 732" (one per flown segment).
     const segments = r.seg.map((s) => {
       const t = s.split(/\s+/);
@@ -117,6 +119,7 @@ function bookingForRow(
       layovers: r.lay.map((l) => ({ airport: l.split(/\s+/)[0] ?? "", minutes: 0 })),
       segments,
       bookingToken: null,
+      ...(r.provider && r.bookingUrl ? { provider: r.provider, bookingUrl: r.bookingUrl } : {}),
     } as unknown as Itinerary;
   };
 

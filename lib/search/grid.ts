@@ -2,9 +2,9 @@ import type { FlightPlan, GridVia, GridView, SearchRequest } from "@/lib/types";
 import { AIRPORTS } from "@/lib/airports";
 import { isDay } from "@/lib/format";
 import type { FlightBackend } from "@/lib/flights/backend";
-import { countsInGrid, gridCellCount, longStays } from "@/lib/flights/calendar";
+import { gridCellCount, longStays } from "@/lib/flights/calendar";
 import type { DatePricePoint } from "@/lib/flights/types";
-import { asker, resolveEndpoint, type Endpoint } from "./asking";
+import { askCalendar, asker, resolveEndpoint, type Endpoint } from "./asking";
 import { CandidatePool } from "./candidates";
 import { daysBetween, queryFor, shiftDay } from "./core";
 import { assembleGrid, type GridSource } from "./engine";
@@ -66,6 +66,10 @@ export async function buildGrid(opts: {
 }): Promise<GridView | null> {
   const { backend, req, ask, existing } = opts;
   const log = opts.log ?? (() => {});
+  if (!backend.dateGrid && !backend.priceGraph) {
+    log(`${backend.name} has no calendars, so no grid`);
+    return null;
+  }
   const signal = opts.signal ?? AbortSignal.timeout(GRID_DEADLINE_MS);
   const asking = asker({ signal, log: (t) => log(t.trim()) });
   // Stays past three weeks only add cells, so a miss there keeps what came back and doesn't fail the grid.
@@ -103,9 +107,6 @@ export async function buildGrid(opts: {
     for (const p of pts) if (p.price != null) m.set(p.outDate, Math.min(m.get(p.outDate) ?? Infinity, p.price));
     graphs.set(key, m);
   };
-  const days = (w: [string, string]) => daysBetween(w[0], w[1]) + 1;
-  // Timeouts match the search's (engine.ts).
-  const graph = { settleMs: 2_500, timeoutMs: 5_000, hedgeMs: 1_500 };
   const jobs: Promise<unknown>[] = [];
   const named = (w: Ask) => (existing ? ` ${w.out[0]}–${w.out[1]}${w.ret ? ` × ${w.ret[0]}–${w.ret[1]}` : ""}` : "");
   for (const { o, d, oq, dq } of combos) {
@@ -120,23 +121,23 @@ export async function buildGrid(opts: {
         const ret = w.ret!;
         const q = queryFor(req, oq, dq, w.out[0], ret[1]);
         const cells = gridCellCount(w.out, ret);
-        if (cells) jobs.push(asking.settleCalendar(`price grid ${o}→${d}${named(w)}`, (signal, enough) => backend.dateGrid(q, w.out, ret, { signal, settleMs: 8_000, timeoutMs: 15_000, hedgeMs: 2_500, enough }), cells, take, countsInGrid));
+        if (cells) jobs.push(askCalendar(asking, `price grid ${o}→${d}${named(w)}`, backend.dateGrid ? (co) => backend.dateGrid!(q, w.out, ret, co) : null, take));
         // The grid can omit stays past three weeks, so a price graph per stay length fills them in (also as one ticket).
         for (const stay of longStays(w.out, ret, daysBetween(requested.out, requested.ret)))
           jobs.push(
-            extra.settleCalendar(`${stay.days}-day trips ${o}→${d}${named(w)}`, (signal, enough) => backend.priceGraph(q, stay.range, [stay.days, stay.days], { signal, settleMs: 8_000, timeoutMs: 15_000, hedgeMs: 2_500, enough }), stay.cells, (pts) =>
+            askCalendar(extra, `${stay.days}-day trips ${o}→${d}${named(w)}`, backend.priceGraph ? (co) => backend.priceGraph!(q, stay.range, [stay.days, stay.days], co) : null, (pts) =>
               take(pts.filter((p) => p.returnDate && p.returnDate >= ret[0] && p.returnDate <= ret[1]))
             )
           );
       }
       // One-way graphs span the full windows: a new day pairs with every day the other way, and one call covers any range.
       if (ask.separate) {
-        jobs.push(asking.settleCalendar(`one-way prices ${o}→${d}`, (signal, enough) => backend.priceGraph(queryFor(req, oq, dq, outWin[0], null), outWin, [1, 1], { signal, ...graph, enough }), days(outWin), (pts) => takeGraph(graphsOut, `${o}~${d}`, pts)));
-        jobs.push(asking.settleCalendar(`one-way prices ${d}→${o}`, (signal, enough) => backend.priceGraph(queryFor(req, dq, oq, retWin[1], null), retWin, [1, 1], { signal, ...graph, enough }), days(retWin), (pts) => takeGraph(graphsBack, `${d}~${o}`, pts)));
+        jobs.push(askCalendar(asking, `one-way prices ${o}→${d}`, backend.priceGraph ? (co) => backend.priceGraph!(queryFor(req, oq, dq, outWin[0], null), outWin, [1, 1], co) : null, (pts) => takeGraph(graphsOut, `${o}~${d}`, pts)));
+        jobs.push(askCalendar(asking, `one-way prices ${d}→${o}`, backend.priceGraph ? (co) => backend.priceGraph!(queryFor(req, dq, oq, retWin[1], null), retWin, [1, 1], co) : null, (pts) => takeGraph(graphsBack, `${d}~${o}`, pts)));
       }
     } else {
       for (const w of asks)
-        jobs.push(asking.settleCalendar(`one-way prices ${o}→${d}${named(w)}`, (signal, enough) => backend.priceGraph(queryFor(req, oq, dq, w.out[0], null), w.out, [1, 1], { signal, ...graph, enough }), days(w.out), (pts) => takeGraph(graphsOut, `${o}~${d}`, pts)));
+        jobs.push(askCalendar(asking, `one-way prices ${o}→${d}${named(w)}`, backend.priceGraph ? (co) => backend.priceGraph!(queryFor(req, oq, dq, w.out[0], null), w.out, [1, 1], co) : null, (pts) => takeGraph(graphsOut, `${o}~${d}`, pts)));
     }
   }
   await Promise.all(jobs);

@@ -99,6 +99,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ slu
   try {
     const { plans, rows } = await flightsForCell({
       backend: deps.backend,
+      fallback: deps.fallback,
       req: r,
       ask: { from, to, backFrom, outDate, returnDate, tickets },
       names,

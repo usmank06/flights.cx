@@ -4,8 +4,9 @@ import { recordMetric, searchEvent, simpleEvent, tripShape } from "@/lib/metrics
 import { newSlug } from "@/lib/slug";
 import { FOLLOWUP_FAILED, store, withLiveness, type Store } from "@/lib/store";
 import { seatedTravellers, type FlightPlan, type FollowUp, type PlanView, type SearchEvent, type SearchPhase, type SearchRecord, type SearchRequest } from "@/lib/types";
+import { airportsOfPlace } from "./asking";
 import { noteRouteSwaps, plansFromPicks } from "./assemble";
-import { liveBackend } from "@/lib/flights/provider";
+import { fallbackBackend, liveBackend } from "@/lib/flights/provider";
 import { demoBackend, demoPlannerOn } from "./demo";
 import { rowsForModel, tripFacts, type CompactRow } from "./core";
 import { codeLine, runSearch, SearchFailure, toPlanView, type EngineDeps, type LogKind } from "./engine";
@@ -43,11 +44,14 @@ export function liveDeps(opts: { today?: string } = {}): EngineDeps {
   const exploreModel = hasKey ? resolveModel(process.env.FLIGHTS_EXPLORE_MODEL || DEFAULT_EXPLORE_KEY) : null;
   // DEMO_LATENCY_MS slows the demo market, for watching a search progress.
   const backend = live ?? demoBackend({ latency: Number(process.env.DEMO_LATENCY_MS) || 120 });
+  // Only a live provider has a fallback, not the demo market.
+  const fallback = live ? fallbackBackend({ airportsOf: airportsOfPlace }) : null;
   // Cache place lookups, since the planner may run twice per search.
-  const looked = new Map<string, ReturnType<typeof backend.places>>();
-  const places = (text: string) => looked.get(text) ?? looked.set(text, backend.places(text, { timeoutMs: 5_000 })).get(text)!;
+  const looked = new Map<string, ReturnType<NonNullable<typeof backend.places>>>();
+  const places = (text: string) => looked.get(text) ?? looked.set(text, backend.places ? backend.places(text) : Promise.resolve([])).get(text)!;
   return {
     backend,
+    fallback,
     planner: plannerModel ? (req, o) => planTrip(req, plannerModel, { ...o, today: opts.today, places }) : demo ? demoPlannerOn(opts.today) : null,
     explorer: exploreModel ? liveExploreAgent(exploreModel) : null,
     jev: hasKey ? liveJev : null,
@@ -365,7 +369,7 @@ async function answerOnce(s: Store, slug: string, id: string, deps: EngineDeps, 
     const signal = AbortSignal.timeout(FOLLOWUP_SEARCH_MS);
     const [found, built] = await Promise.all([
       result.search.queries.length
-        ? runFollowUpQueries({ backend: deps.backend, req: current.request, queries: result.search.queries, existing: rows, signal, log: (l) => lines.push(l) })
+        ? runFollowUpQueries({ backend: deps.backend, fallback: deps.fallback, req: current.request, queries: result.search.queries, existing: rows, signal, log: (l) => lines.push(l) })
         : Promise.resolve({ rows: [] as CompactRow[], asked: 0, calls: 0, firstId: 0, unanswered: [] as string[] }),
       result.search.grid || result.search.explore
         ? runFollowUpViews({

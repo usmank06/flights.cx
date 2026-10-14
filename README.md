@@ -27,7 +27,10 @@ reCAPTCHA) is for production.
 The app talks to flights through one interface, `FlightBackend` in `lib/flights/backend.ts`. To use a real provider:
 
 1. Implement `FlightBackend` against a flight data API, parsing its answers into the types in `lib/flights/types.ts`.
-2. Return it from `liveBackend()` in `lib/flights/provider.ts`, and build its booking links in `bookingFor()`.
+   Only `shopping` is required. Leave out what the API doesn't have, and that feature is off. Each call asks again on its
+   own until it answers, and `lib/flights/retry.ts` has a loop for that.
+2. Return it from `liveBackend()` in `lib/flights/provider.ts`, and build its booking links in `liveBooking()`. A second
+   provider that only has fares can answer when the first one fails, through `fallbackBackend()`.
 3. Add any settings it needs in production, and the hosts its images come from, to `lib/flights/provider-config.ts`.
 
 The model prompts in `lib/search/prompts.ts` are shortened placeholders. They work, but you'll get better results by

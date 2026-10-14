@@ -1,5 +1,6 @@
 import { AIRPORT_LIST, AIRPORTS } from "@/lib/airports";
-import type { CallOptions, ExploreOptions, FlightBackend } from "@/lib/flights/backend";
+import type { CallOptions, ExploreOptions, FlightBackend, ProviderTiming } from "@/lib/flights/backend";
+import { asked, type Retry } from "@/lib/flights/retry";
 import type { DatePricePoint, ExploreDestination, Itinerary, PlaceHit, Segment, SearchInput, ShoppingPayload } from "@/lib/flights/types";
 import type { SearchRequest } from "@/lib/types";
 import type { Planner } from "./engine";
@@ -37,7 +38,7 @@ export type DemoScript = {
   explore?: "nearest" | "two";
 };
 
-export type DemoBackend = FlightBackend & { calls: string[]; trips: string[]; legs: string[] };
+export type DemoBackend = FlightBackend & Required<Pick<FlightBackend, "returns" | "dateGrid" | "priceGraph" | "explore" | "places" | "declareUnencoded">> & { calls: string[]; trips: string[]; legs: string[] };
 
 /** USD prices whose digits can't appear in a date, time or duration, so a price leaked to a model is detectable. */
 export const DEMO_PRICES = [1357, 1468, 1579, 2681, 2792, 3913];
@@ -174,6 +175,20 @@ export { after as demoAfter, days as demoDays, market as demoItineraries, payloa
 
 /* -------------------------------- The market ------------------------------- */
 
+/** Timing and retries like a live provider's, so the engine runs on the same clocks against the demo market. */
+export const DEMO_TIMING: ProviderTiming = { returnsWaitMs: 30_000, longStaysGraceMs: 4_000 };
+export const DEMO_RETRY: Retry = { asks: 4, askAgainMs: 600 };
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+/** Wraps a scripted call so it is asked again the way a provider asks itself. The call's last argument is its options. */
+export function demoAsks<T>(fn: (...args: any[]) => Promise<T>): (...args: any[]) => Promise<T> {
+  return (...args: any[]) => {
+    const opts: CallOptions = args[args.length - 1] ?? {};
+    return asked((signal) => fn(...args.slice(0, -1), { ...opts, signal }), DEMO_RETRY, opts);
+  };
+}
+/* eslint-enable @typescript-eslint/no-explicit-any */
+
 export function demoBackend(script: DemoScript = {}): DemoBackend {
   const calls: string[] = [];
   const trips: string[] = [];
@@ -181,24 +196,31 @@ export function demoBackend(script: DemoScript = {}): DemoBackend {
   const made: Partial<Record<DemoCall, number>> = {};
   const dearer = script.dearerOneTicket ?? ["OPO"];
   const cheaper = script.cheaperOneWay ?? { outTo: "LIS", backFrom: "OPO" };
-  const run = <T>(kind: DemoCall, signal: AbortSignal | undefined, make: () => T): Promise<T> => {
-    calls.push(kind);
-    made[kind] = (made[kind] ?? 0) + 1;
-    if (script.hang?.includes(kind)) return after(Infinity, make, signal);
-    if (script.fail?.includes(kind) || made[kind]! <= (script.failFirst?.[kind] ?? 0))
-      return after(script.latency ?? 20, () => {
-        throw new Error(`${kind} failed`);
-      }, signal);
-    return after(script.latency ?? 20, make, signal);
-  };
-  const signalOf = (opts?: CallOptions) => opts?.signal;
+  // Asked again the way the live provider asks itself (DEMO_RETRY), with the script applied to each ask.
+  const run = <T>(kind: DemoCall, opts: CallOptions | undefined, make: () => T): Promise<T> =>
+    asked(
+      (signal) => {
+        calls.push(kind);
+        made[kind] = (made[kind] ?? 0) + 1;
+        if (script.hang?.includes(kind)) return after(Infinity, make, signal);
+        if (script.fail?.includes(kind) || made[kind]! <= (script.failFirst?.[kind] ?? 0))
+          return after(script.latency ?? 20, () => {
+            throw new Error(`${kind} failed`);
+          }, signal);
+        return after(script.latency ?? 20, make, signal);
+      },
+      DEMO_RETRY,
+      opts
+    );
   return {
+    name: "Demo market",
     live: false,
+    timing: DEMO_TIMING,
     calls,
     trips,
     legs,
     shopping: (input: SearchInput, opts?: CallOptions) =>
-      run("shopping", signalOf(opts), () => {
+      run("shopping", opts, () => {
         const bagless = !input.carry_on_bags && !input.checked_bags;
         const leg = input.flights[0];
         trips.push(input.trip ?? "round-trip");
@@ -209,7 +231,7 @@ export function demoBackend(script: DemoScript = {}): DemoBackend {
         return payloadOf(market(leg.from_airport, leg.to_airport, leg.date, 6, bagless && script.bagsOnRequest ? "ZZ" : "QR", input.currency), bagless, input.currency);
       }),
     returns: (input, outbound, opts) =>
-      run("returns", signalOf(opts), () => {
+      run("returns", opts, () => {
         const back = input.flights[1];
         // Returns carry the round-trip total: the outbound's price, rising by 40 per option.
         const outPrice = DEMO_PRICES[Number(outbound.segments[0].flightNumber) - 100] ?? DEMO_PRICES[0];
@@ -218,24 +240,24 @@ export function demoBackend(script: DemoScript = {}): DemoBackend {
         return payloadOf(itins, false, input.currency);
       }),
     dateGrid: (input, outWindow, returnWindow, opts) =>
-      run("dateGrid", signalOf(opts), () => {
+      run("dateGrid", opts, () => {
         const cells: DatePricePoint[] = [];
         const bump = dearer.includes(codeOf(input.flights[0].to_airport)) ? 200 : 0;
         for (const o of days(...outWindow)) for (const r of days(...returnWindow)) if (r > o) cells.push({ outDate: o, returnDate: r, price: inCurrency(DEMO_PRICES[(o.charCodeAt(9) + r.charCodeAt(9)) % DEMO_PRICES.length] + bump, input.currency) });
-        return cells;
+        return { points: cells, settled: true };
       }),
     priceGraph: (input, range, tripDays, opts) =>
-      run("priceGraph", signalOf(opts), () => {
+      run("priceGraph", opts, () => {
         void tripDays;
         // One-way prices by day. On some day pairs, two one-ways undercut the round trip.
         const from = codeOf(input.flights[0].from_airport);
         const to = codeOf(input.flights[0].to_airport);
         const back = to !== cheaper.outTo && to !== cheaper.backFrom;
         const discount = back ? (from === cheaper.backFrom ? -60 : 0) : to === cheaper.outTo ? -60 : 0;
-        return days(...range).map((day): DatePricePoint => ({ outDate: day, returnDate: null, price: inCurrency((back ? 640 : 600) + (day.charCodeAt(9) % 3) * 90 + discount, input.currency) }));
+        return { points: days(...range).map((day): DatePricePoint => ({ outDate: day, returnDate: null, price: inCurrency((back ? 640 : 600) + (day.charCodeAt(9) % 3) * 90 + discount, input.currency) })), settled: true };
       }),
     explore: (origin: string, opts: ExploreOptions) =>
-      run("explore", opts.signal, () => {
+      run("explore", opts, () => {
         const place = (code: string, name: string, country: string, i: number): ExploreDestination => ({
           id: airportId(code),
           name,
@@ -263,21 +285,18 @@ export function demoBackend(script: DemoScript = {}): DemoBackend {
           .slice(0, 10)
           .map((a, i) => place(a.code, a.city, a.country, i));
       }),
-    places: async (text: string) => {
-      calls.push("places");
-      if (script.placesFail) throw new Error("places down");
-      const t = text.trim();
-      const code = resolveAirport(t);
-      if (!code) return [];
-      const city = AIRPORTS[code]?.city;
-      const list = city ? CITY_AIRPORTS.get(city) : undefined;
-      // A city name returns the city entity with all its airports. A typed code returns that airport.
-      if (city && list && list.length > 1 && t.toUpperCase() !== code) {
-        const hits: PlaceHit[] = [{ kind: "city", name: city, id: cityId(city), code: null, airports: list.map((c, i) => ({ code: c, name: `${city} (${c})`, km: 10 + i * 15 })) }];
-        return hits;
-      }
-      return [{ kind: "airport", name: `${city ?? code} Airport`, id: airportId(code), code, airports: [] }];
-    },
+    places: (text: string, opts?: CallOptions) =>
+      run("places", opts, (): PlaceHit[] => {
+        if (script.placesFail) throw new Error("places down");
+        const t = text.trim();
+        const code = resolveAirport(t);
+        if (!code) return [];
+        const city = AIRPORTS[code]?.city;
+        const list = city ? CITY_AIRPORTS.get(city) : undefined;
+        // A city name returns the city entity with all its airports. A typed code returns that airport.
+        if (city && list && list.length > 1 && t.toUpperCase() !== code) return [{ kind: "city", name: city, id: cityId(city), code: null, airports: list.map((c, i) => ({ code: c, name: `${city} (${c})`, km: 10 + i * 15 })) }];
+        return [{ kind: "airport", name: `${city ?? code} Airport`, id: airportId(code), code, airports: [] }];
+      }),
     declareUnencoded: () => [],
   };
 }

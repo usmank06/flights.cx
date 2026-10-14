@@ -124,6 +124,10 @@ export type PlanBooking = {
   returnUrl?: string;
   /** The provider's opaque token for this itinerary, when it has one. */
   token?: string | null;
+  /** When `url` isn't the live provider's booking page, the provider it books with, whose ticket it is. */
+  site?: string;
+  /** The same for `returnUrl`. */
+  returnSite?: string;
 };
 
 /** Jev's scores for a plan: its probabilities as whole-number percentages. Absent when code picked. */
@@ -353,6 +357,8 @@ export type SearchStats = {
   costUsd: number | null;
   /** Lookups that never answered in time, which the search went on without. Absent on older searches. */
   missed?: number;
+  /** Fares lookups the fallback provider answered when the live one didn't. Absent on older searches, or without a fallback. */
+  fallback?: number;
 };
 
 /** How the search read the brief, for the page. Dates are ISO; the page formats them. */

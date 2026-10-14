@@ -256,8 +256,14 @@ export function PlanDetails({ plan, locale, cheapest, saved, named }: { plan: Fl
         <section className="flex flex-col gap-2">
           <Eyebrow>Back · {ret ? dayLabel(ret, locale) : (plan.returnDate ?? "")}</Eyebrow>
           <div className="flex flex-col gap-1.5 rounded-2xl bg-soft px-4 py-3.5 text-[14px] leading-relaxed text-ink-soft">
-            <p className="font-semibold text-ink">One ticket, there and back. You pick the flight home when you book.</p>
-            <p>The cheapest flight home{plan.backFrom ? `, leaving from ${cityOf(plan.backFrom)},` : ""} is the price above.</p>
+            {plan.booking.site ? (
+              <p className="font-semibold text-ink">One ticket, there and back, sold by {plan.booking.site}. The flight home is its cheapest, which this link books.</p>
+            ) : (
+              <>
+                <p className="font-semibold text-ink">One ticket, there and back. You pick the flight home when you book.</p>
+                <p>The cheapest flight home{plan.backFrom ? `, leaving from ${cityOf(plan.backFrom)},` : ""} is the price above.</p>
+              </>
+            )}
           </div>
         </section>
       )}
@@ -273,7 +279,7 @@ function BookFooter({ plan, slug }: { plan: FlightPlan; slug: string }) {
   if (isPaired(plan)) {
     const out = plan.legs.find((l) => l.direction === "outbound");
     const back = plan.legs.find((l) => l.direction === "return");
-    const ticket = (n: number, leg: FlightLeg | undefined, url: string, primary: boolean) => (
+    const ticket = (n: number, leg: FlightLeg | undefined, url: string, primary: boolean, site?: string) => (
       <a
         href={url}
         target="_blank"
@@ -284,29 +290,32 @@ function BookFooter({ plan, slug }: { plan: FlightPlan; slug: string }) {
         <span className="text-[14px] font-semibold">
           {exact ? "Book" : "See"} ticket {n}
         </span>
-        {leg && <span className={cx("text-[11.5px]", primary ? "text-white/85" : "text-ink-muted")}>{`${cityOf(leg.from)} → ${cityOf(leg.to)}`}</span>}
+        {leg && <span className={cx("text-[11.5px]", primary ? "text-white/85" : "text-ink-muted")}>{`${cityOf(leg.from)} → ${cityOf(leg.to)}${site ? ` · ${site}` : ""}`}</span>}
       </a>
     );
     return (
       <div className="flex flex-col gap-2">
         <div className="flex gap-2">
-          {ticket(1, out, b.url, true)}
-          {ticket(2, back, b.returnUrl!, false)}
+          {ticket(1, out, b.url, true, b.site)}
+          {ticket(2, back, b.returnUrl!, false, b.returnSite)}
         </div>
         <p className="text-center text-[12px] text-ink-muted">Two tickets, booked separately. The price above is for both.</p>
       </div>
     );
   }
   return (
-    <a
-      href={b.url}
-      target="_blank"
-      rel="noopener noreferrer"
-      onClick={click}
-      className="btn-primary press flex h-12 w-full items-center justify-center gap-2 rounded-2xl text-[15.5px] font-semibold"
-    >
-      {!exact ? "See these flights" : returnToPick(plan) ? "Book and pick the flight home" : "Book these flights"}
-      <ExternalLink className="h-4 w-4" strokeWidth={2.2} />
-    </a>
+    <div className="flex flex-col gap-2">
+      <a
+        href={b.url}
+        target="_blank"
+        rel="noopener noreferrer"
+        onClick={click}
+        className="btn-primary press flex h-12 w-full items-center justify-center gap-2 rounded-2xl text-[15.5px] font-semibold"
+      >
+        {!exact ? "See these flights" : b.site ? `Book on ${b.site}` : returnToPick(plan) ? "Book and pick the flight home" : "Book these flights"}
+        <ExternalLink className="h-4 w-4" strokeWidth={2.2} />
+      </a>
+      {b.site && <p className="text-center text-[12px] text-ink-muted">Sold by {b.site} as its own ticket, under its terms rather than the airline’s.</p>}
+    </div>
   );
 }

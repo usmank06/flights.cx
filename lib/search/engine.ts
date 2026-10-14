@@ -1,5 +1,5 @@
-import { isPlaceId, type FlightBackend } from "@/lib/flights/backend";
-import { countsInGrid, gridCellCount, longStays } from "@/lib/flights/calendar";
+import { isPlaceId, type FlightBackend, type ProviderTiming } from "@/lib/flights/backend";
+import { longStays } from "@/lib/flights/calendar";
 import { bookingFor } from "@/lib/flights/provider";
 import type { BookingContext, DatePricePoint, ExploreDestination, SearchInput, ShoppingPayload } from "@/lib/flights/types";
 import { AIRPORTS } from "@/lib/airports";
@@ -25,7 +25,7 @@ import type {
 } from "@/lib/types";
 import { seatedTravellers } from "@/lib/types";
 import { noteRouteSwaps } from "./assemble";
-import { airportsOf as airportsFor, asker, resolveEndpoint as lookUpEndpoint, SHOPPING_TIMEOUT_MS, type Asker } from "./asking";
+import { airportsOf as airportsFor, askCalendar, asker, faresAsker, resolveEndpoint as lookUpEndpoint, type Asker } from "./asking";
 import { bookableFor, CandidatePool, stayNights } from "./candidates";
 import { compactForLLM, daysBetween, describeInput, PLACE_NAMES, itinToLeg, languageTag, queryFor, shiftDay, tripFacts, type IndexedItin } from "./core";
 import { metroCodes } from "./intake";
@@ -52,6 +52,8 @@ export type EngineHooks = {
 export type Planner = (req: SearchRequest, opts: { signal?: AbortSignal; timeoutMs?: number; again?: boolean }) => Promise<PlanOutcome>;
 export type EngineDeps = {
   backend: FlightBackend;
+  /** A second provider for fares, asked when the live one never answers or says there are none (lib/flights/provider.ts). */
+  fallback?: FlightBackend | null;
   /** null: nothing can read the trip, so every search ends with an error. */
   planner: Planner | null;
   /** Open destinations: picks places to price (up to three rounds) and what to show. null: price the cheapest, Jev picks. */
@@ -113,14 +115,8 @@ const ONE_WAYS_TO_PAIR = 8;
  */
 const STOP_AT = { pricing: 0.5, widening: 0.75, returns: 0.875 } as const;
 type Stage = keyof typeof STOP_AT;
-/** How long stays past three weeks can keep the first stage waiting once its other calls are done, never past its stop. */
-const LONG_STAYS_GRACE_MS = 4_000;
-/**
- * How long a fare's flights home are asked for: one full ask (two 12 s attempts and the hedge, about 25 s), not the rest of
- * the search. A fare whose return never answers keeps its price and links to the return choice. At most a quarter of the
- * deadline.
- */
-const RETURNS_WAIT_MS = 30_000;
+/** How long the engine waits for a fare's flights home and for long stays, unless the provider sets its own timing. */
+const DEFAULT_TIMING: ProviderTiming = { returnsWaitMs: 30_000, longStaysGraceMs: 4_000 };
 
 /** One origin × destination pair: airport codes to show (o, d) and query endpoints (oq, dq), which may be place ids. */
 export type Combo = { o: string; d: string; oq: string; dq: string };
@@ -147,6 +143,9 @@ export async function runSearch(
   const killer = new AbortController();
   let killTimer = setTimeout(() => killer.abort(), deadlineMs);
   const { backend } = deps;
+  const timing: ProviderTiming = { ...DEFAULT_TIMING, ...backend.timing };
+  const fallback = deps.fallback ?? null;
+  let fallbacks = 0;
   const log = hooks.log;
   const fmt = (n: number) => money(n, req.currency, req.locale);
 
@@ -155,6 +154,14 @@ export async function runSearch(
   const photos = new Map<string, string>();
   let queries = 0;
   const notes: string[] = [];
+  const offNoted = new Set<string>();
+  /** Says once that the provider has no such feature. The search goes on without it, and that isn't a gap. */
+  const off = (feature: string, so: string) => {
+    if (offNoted.has(feature)) return;
+    offNoted.add(feature);
+    log(`${backend.name} has no ${feature}, so ${so}`, "info");
+    notes.push(`No ${feature} from ${backend.name}: ${so}`);
+  };
   let jevUsage: { in: number; out: number; costUsd: number | null } | null = null;
   let voiceUsage: { in: number; out: number; costUsd: number | null } | null = null;
   const agentUsages: { in: number; out: number; costUsd: number | null }[] = [];
@@ -184,7 +191,14 @@ export async function runSearch(
     for (const stage of Object.keys(STOP_AT) as Stage[]) stopTimers.push(setTimeout(() => stops[stage].abort(), Math.max(0, Math.floor(untilStop(stage)))));
   };
   armStops();
-  const askerFor = (stage: Stage, bestEffort = false) => asker({ signal: AbortSignal.any([killer.signal, stops[stage].signal]), log, onAsk: () => queries++, bestEffort });
+  /** A stage's asker, plus a second one for the fallback's calls, whose misses never count as gaps. */
+  const spares = new Map<Asker, Asker | null>();
+  const askerFor = (stage: Stage, bestEffort = false) => {
+    const signal = AbortSignal.any([killer.signal, stops[stage].signal]);
+    const ask = asker({ signal, log, onAsk: () => queries++, bestEffort });
+    spares.set(ask, fallback ? asker({ signal, log, onAsk: () => queries++, bestEffort: true }) : null);
+    return ask;
+  };
   const pricing = askerFor("pricing");
   // Widening's calls, including early cell buys, and an open search's places.
   const widening = askerFor("widening");
@@ -221,19 +235,25 @@ export async function runSearch(
      * Round trips are asked by airport code, since a place id is much slower for them and often dearer for the same flights.
      * One-ways, grids and graphs use the place, where one call covers all its airports. See `roundTrips`.
      */
-    /** Asks one shopping call through a stage's asker until it answers or the stage stops. */
-    const askShopping = (ask: Asker, input: SearchInput, what: string, attempts = 2) =>
-      ask.must((signal) => backend.shopping(input, { signal, hedgeMs: 2_000, timeoutMs: SHOPPING_TIMEOUT_MS, attempts }), what);
+    /** Asks one fares call through a stage's asker, with the fallback provider in reserve (`faresAsker`, asking.ts). */
+    const shoppers = new Map<Asker, ReturnType<typeof faresAsker>>();
+    const askShopping = (ask: Asker, input: SearchInput, what: string, checkEmpty = false) => {
+      let shopper = shoppers.get(ask);
+      if (!shopper) shoppers.set(ask, (shopper = faresAsker({ backend, fallback, ask, spare: spares.get(ask) ?? null, log, onFallback: () => fallbacks++ })));
+      return shopper(input, what, { checkEmpty });
+    };
+    /** The call between the two places' own airports. It's the one checked against the fallback when it comes back empty. */
+    const isMain = (input: SearchInput, o: string, d: string) => input.flights[0].from_airport === o && input.flights[0].to_airport === d;
     /** Adds an answer's fares to the pool. */
     const take = (payload: ShoppingPayload, input: SearchInput, what: string, shift?: { out: number; ret: number }) => {
       const added = pool.add(payload.itineraries, input, queries, shift);
       for (const pl of payload.places ?? []) if (pl.image && !photos.has(pl.code)) photos.set(pl.code, pl.image);
       const cheapest = Math.min(...payload.itineraries.map((i) => i.price ?? Infinity));
-      log(`  ${describeInput(input)} → ${payload.itineraries.length} itineraries${Number.isFinite(cheapest) ? ` from ${fmt(cheapest)}` : ""} — ${what}`, "info");
+      log(`  ${describeInput(input)} → ${payload.itineraries.length} itineraries${Number.isFinite(cheapest) ? ` from ${fmt(cheapest)}` : ""} — ${what}${payload.provider ? ` (${payload.provider})` : ""}`, "info");
       return { payload, added };
     };
-    const shop = (ask: Asker, input: SearchInput, what: string, shift?: { out: number; ret: number }, attempts = 2) =>
-      askShopping(ask, input, what, attempts).then((payload) => (payload ? take(payload, input, what, shift) : null));
+    const shop = (ask: Asker, input: SearchInput, what: string, shift?: { out: number; ret: number }, checkEmpty = false) =>
+      askShopping(ask, input, what, checkEmpty).then((payload) => (payload ? take(payload, input, what, shift) : null));
 
     // An object rather than `let`s: the payloads are assigned in callbacks, and narrowing would treat a `let` as always null.
     const got: { baseline: ShoppingPayload | null; bagless: ShoppingPayload | null } = { baseline: null, bagless: null };
@@ -310,7 +330,7 @@ export async function runSearch(
     if (grouped) log(`${grouped} place${grouped > 1 ? "s" : ""} with several airports: one-ways and the grid asked for all of them at once, round trips by airport`, "info");
     const placeName = (code: string) => plan.origins.find((p) => p.code === code)?.name ?? plan.destinations.find((p) => p.code === code)?.name ?? AIRPORTS[code]?.city ?? code;
     const destsLine = plan.destinations.map((p) => p.name).join(" or ");
-    const unencoded = backend.declareUnencoded(queryFor(req, from, dests[0] ?? "AAA", outDate, retDate));
+    const unencoded = backend.declareUnencoded?.(queryFor(req, from, dests[0] ?? "AAA", outDate, retDate)) ?? [];
     for (const u of unencoded) log(u.note, "info");
 
     // The provider omits insights and hints when a bag filter is set, so a bagless call supplies them. It never sets the baseline.
@@ -328,8 +348,9 @@ export async function runSearch(
         (back && back !== d ? [d] : airportsOf(d)).map((t) => ({ input: queryFor(req, f, t, out, ret, "", back && back !== d ? back : undefined), what: `${what}${f !== o ? ` from ${f}` : ""}${t !== d ? ` into ${t}` : ""}` }))
       );
     /** Buys one round trip, a call per airport pair at both ends. */
-    const roundTrips = (ask: Asker, o: string, d: string, out: string, ret: string | null, what: string, shift: { out: number; ret: number }, attempts = 2, back?: string) =>
-      Promise.all(roundTripCalls(o, d, out, ret, what, back).map((c) => shop(ask, c.input, c.what, shift, attempts)));
+    /** Buys one round trip, a call per airport pair at both ends. `own`: their own search, whose main call is checked when empty. */
+    const roundTrips = (ask: Asker, o: string, d: string, out: string, ret: string | null, what: string, shift: { out: number; ret: number }, back?: string, own = false) =>
+      Promise.all(roundTripCalls(o, d, out, ret, what, back).map((c) => shop(ask, c.input, c.what, shift, own && isMain(c.input, o, d))));
     /**
      * The one airport that never answered in a round trip's calls (`roundTripCalls`): every miss used it and no answer did.
      * Empty when nothing answered or the misses don't share an airport.
@@ -353,7 +374,7 @@ export async function runSearch(
      */
     const ownSearch = async (o: string, d: string, what: string) => {
       const calls = roundTripCalls(o, d, outDate, retDate, what);
-      const answers = await Promise.all(calls.map((c) => askShopping(pricing, c.input, c.what)));
+      const answers = await Promise.all(calls.map((c) => askShopping(pricing, c.input, c.what, isMain(c.input, o, d))));
       return answers.every(Boolean) ? calls.map((c, i) => ({ ...c, payload: answers[i]! })) : null;
     };
     /** Of the answers for one trip from several airports, the one with the cheapest fare. */
@@ -376,21 +397,21 @@ export async function runSearch(
      * Buys a grid cell as one ticket, into the cell's airport and back from its return airport. A call that never answers
      * leaves the cell unconfirmed.
      */
-    const buyCell = (c: GridCell, attempts: number) => {
+    const buyCell = (c: GridCell) => {
       const ret = retWin ? c.returnDate : null;
       const shift = { out: daysBetween(outDate, c.outDate), ret: retDate && ret ? daysBetween(retDate, ret) : 0 };
       const to = c.via?.out ?? dests[0];
       const back = c.via?.back ?? to;
       const what = `dates ${c.outDate}${ret ? ` → ${ret}` : ""}${back !== to ? ` (back from ${back})` : combos.length > 1 ? ` to ${to}` : ""}`;
-      return roundTrips(widening, from, to, c.outDate, ret, what, shift, attempts, back).then((rs) => {
+      return roundTrips(widening, from, to, c.outDate, ret, what, shift, back).then((rs) => {
         if (!rs.every(Boolean)) unconfirmed(c.outDate, ret, from, to, missedAirport(roundTripCalls(from, to, c.outDate, ret, what, back), rs));
         return rs;
       });
     };
     /** One direction on its own, kept with the one-ways for pairing. */
-    const buyOneWay = (leg: "out" | "back", a: string, b: string, day: string, shift: number, attempts: number) => {
+    const buyOneWay = (leg: "out" | "back", a: string, b: string, day: string, shift: number) => {
       const list = leg === "out" ? oneWays.out : oneWays.ret;
-      return shop(widening, queryFor(req, a, b, day, null), leg === "out" ? `one-way to ${b} on ${day}` : `one-way back from ${a} on ${day}`, leg === "out" ? { out: shift, ret: 0 } : { out: 0, ret: shift }, attempts).then((r) => {
+      return shop(widening, queryFor(req, a, b, day, null), leg === "out" ? `one-way to ${b} on ${day}` : `one-way back from ${a} on ${day}`, leg === "out" ? { out: shift, ret: 0 } : { out: 0, ret: shift }).then((r) => {
         if (r) list.push(...r.added);
         else gaps.other++;
       });
@@ -451,7 +472,7 @@ export async function runSearch(
         if (askedCells.has(cellKeyOf(c))) continue;
         askedCells.add(cellKeyOf(c));
         bought++;
-        early.push(buyCell(c, 2));
+        early.push(buyCell(c));
       }
     };
 
@@ -467,12 +488,13 @@ export async function runSearch(
     // A named country or region ("China", "Europe"). Shown places must be inside it, whatever the model picks.
     const area = open ? areaOf(plan.openHint) : null;
     if (open) {
+      // An open search can't go on without Explore, since nothing else lists places.
+      if (!backend.explore) throw failed("Open destinations aren't available right now. Name a city and search again.");
       log(`Looking at where you could go from ${placeName(from)}${plan.dates.anchor.out ? " on those dates" : ""}…`, "action");
       const found = await pricing.must(
-        (signal) =>
-          backend.explore(from, {
-            signal,
-            timeoutMs: 8_000,
+        (o) =>
+          backend.explore!(from, {
+            ...o,
             dates: { out: outDate, ret: retDate },
             passengers: [Math.max(1, req.passengers.adults), req.passengers.children, req.passengers.infantsInSeat, req.passengers.infantsOnLap],
             seat: req.cabin,
@@ -503,7 +525,7 @@ export async function runSearch(
       const base = queryFor(req, combos[0].o, combos[0].d, outDate, retDate, "your own search");
       // For flexible round trips the grid also prices the asked dates, so if their own search doesn't fully answer, widening can
       // buy those dates like any other cell. Widening only buys from the first origin, so other origins' searches aren't retried.
-      const ownOptional = flexible && !!retWin && !!retDate;
+      const ownOptional = flexible && !!retWin && !!retDate && !!backend.dateGrid;
       const ownWhat = (d: string) => (combos.length > 1 ? `your own search to ${d}` : "your own search");
       for (const { o, d } of combos) {
         if (ownOptional && o === from)
@@ -515,7 +537,7 @@ export async function runSearch(
           );
         else
           jobs.push(
-            roundTrips(pricing, o, d, outDate, retDate, ownWhat(d), { out: 0, ret: 0 }).then((rs) => {
+            roundTrips(pricing, o, d, outDate, retDate, ownWhat(d), { out: 0, ret: 0 }, undefined, true).then((rs) => {
               if (rs.every(Boolean)) return noteBaseline(cheapestOf(rs), d);
               // Its fares are real and stay in the pool, but the cheapest of the airports that answered isn't a fair baseline.
               ownMissing.add(`${o}~${d}`);
@@ -537,46 +559,48 @@ export async function runSearch(
           else if (plan.separateTickets) gaps.other++;
         };
         for (const { d, oq, dq } of combos) {
-          jobs.push(shop(pricing, queryFor(req, oq, dq, outDate, null), `outbound to ${d} on its own`, { out: 0, ret: 0 }).then(keep(oneWays.out)));
-          jobs.push(shop(pricing, queryFor(req, dq, oq, retDate, null), `return from ${d} on its own`, { out: 0, ret: 0 }).then(keep(oneWays.ret)));
+          jobs.push(shop(pricing, queryFor(req, oq, dq, outDate, null), `outbound to ${d} on its own`, { out: 0, ret: 0 }, true).then(keep(oneWays.out)));
+          jobs.push(shop(pricing, queryFor(req, dq, oq, retDate, null), `return from ${d} on its own`, { out: 0, ret: 0 }, true).then(keep(oneWays.ret)));
         }
       }
       if (flexible && retWin) {
         // A round-trip grid per destination and one-way graphs each way, so a cell can be the cheaper of one ticket or two.
-        const expected = gridCellCount(outWin, retWin);
+        if (!backend.dateGrid) off("date grid", "the days around yours aren't priced as a grid");
+        if (plan.separateTickets && !backend.priceGraph) off("one-way price graph", "two tickets are checked on your dates only");
         // Stays past the grid's 21 days are asked per length, at most eight, nearest the preferred (or asked) stay first.
         const preferStay = plan.dates.prefer === "longest" ? daysBetween(outWin[0], retWin[1]) : plan.dates.prefer === "shortest" ? daysBetween(outWin[1], retWin[0]) : retDate ? daysBetween(outDate, retDate) : 0;
         for (const { o, d, oq, dq } of combos) {
           const q = queryFor(req, oq, dq, outDate, retDate);
           // One-ticket prices for every pair of days. 15 s timeout, since a cold grid can take ~12 s.
           jobs.push(
-            pricing.settleCalendar(`price grid to ${d}`, (signal, enough) => backend.dateGrid(q, outWin, retWin, { signal, settleMs: 8_000, timeoutMs: 15_000, hedgeMs: 2_500, enough }), expected, (pts) => {
+            askCalendar(pricing, `price grid to ${d}`, backend.dateGrid ? (co) => backend.dateGrid!(q, outWin, retWin, co) : null, (pts) => {
               takeGrid(o, d, pts);
               buyEarly(d);
-            }, countsInGrid).then(gridGap)
+            }).then(gridGap)
           );
           // The grid can omit stays past three weeks, so a price graph per stay length fills them in (also as one ticket).
           for (const stay of longStays(outWin, retWin, preferStay))
             longJobs.push(
-              extra.settleCalendar(`${stay.days}-day trips to ${d}`, (signal, enough) => backend.priceGraph(q, stay.range, [stay.days, stay.days], { signal, settleMs: 8_000, timeoutMs: 15_000, hedgeMs: 2_500, enough }), stay.cells, (pts) =>
+              askCalendar(extra, `${stay.days}-day trips to ${d}`, backend.priceGraph ? (co) => backend.priceGraph!(q, stay.range, [stay.days, stay.days], co) : null, (pts) =>
                 takeGrid(o, d, pts.filter((p) => p.returnDate && p.returnDate >= retWin[0] && p.returnDate <= retWin[1]))
               )
             );
           if (plan.separateTickets) {
-            jobs.push(pricing.settleCalendar(`one-way prices to ${d} by date`, (signal, enough) => backend.priceGraph(queryFor(req, oq, dq, outDate, null), outWin, [1, 1], { signal, settleMs: 2_500, timeoutMs: 5_000, hedgeMs: 1_500, enough }), daysOf(outWin).length, (pts) => takeGraph(graphsOut, `${o}~${d}`, pts)).then(gridGap));
-            jobs.push(pricing.settleCalendar(`one-way prices back from ${d} by date`, (signal, enough) => backend.priceGraph(queryFor(req, dq, oq, retDate ?? retWin[0], null), retWin, [1, 1], { signal, settleMs: 2_500, timeoutMs: 5_000, hedgeMs: 1_500, enough }), daysOf(retWin).length, (pts) => takeGraph(graphsBack, `${d}~${o}`, pts)).then(gridGap));
+            jobs.push(askCalendar(pricing, `one-way prices to ${d} by date`, backend.priceGraph ? (co) => backend.priceGraph!(queryFor(req, oq, dq, outDate, null), outWin, [1, 1], co) : null, (pts) => takeGraph(graphsOut, `${o}~${d}`, pts)).then(gridGap));
+            jobs.push(askCalendar(pricing, `one-way prices back from ${d} by date`, backend.priceGraph ? (co) => backend.priceGraph!(queryFor(req, dq, oq, retDate ?? retWin[0], null), retWin, [1, 1], co) : null, (pts) => takeGraph(graphsBack, `${d}~${o}`, pts)).then(gridGap));
           }
         }
       } else if (flexible) {
+        if (!backend.priceGraph) off("price graph", "the days around yours aren't priced");
         for (const { o, d, oq, dq } of combos)
-          jobs.push(pricing.settleCalendar(`prices to ${d} by departure date`, (signal, enough) => backend.priceGraph(queryFor(req, oq, dq, outDate, null), outWin, [1, 1], { signal, settleMs: 2_500, timeoutMs: 5_000, hedgeMs: 1_500, enough }), daysOf(outWin).length, (pts) => takeGraph(graphsOut, `${o}~${d}`, pts)).then(gridGap));
+          jobs.push(askCalendar(pricing, `prices to ${d} by departure date`, backend.priceGraph ? (co) => backend.priceGraph!(queryFor(req, oq, dq, outDate, null), outWin, [1, 1], co) : null, (pts) => takeGraph(graphsOut, `${o}~${d}`, pts)).then(gridGap));
       }
       // Every call here is asked until it answers or the first stage stops (`STOP_AT`).
       await Promise.allSettled(jobs);
       // Long stays only add cells, so they get a short grace period. A late answer still lands in the grid before it's rebuilt.
       if (longJobs.length) {
         let timer: ReturnType<typeof setTimeout> | undefined;
-        const cutoff = new Promise<void>((res) => (timer = setTimeout(res, Math.max(0, Math.floor(Math.min(LONG_STAYS_GRACE_MS, untilStop("pricing")))))));
+        const cutoff = new Promise<void>((res) => (timer = setTimeout(res, Math.max(0, Math.floor(Math.min(timing.longStaysGraceMs, untilStop("pricing")))))));
         await Promise.race([Promise.allSettled(longJobs), cutoff]);
         clearTimeout(timer);
       }
@@ -586,7 +610,7 @@ export async function runSearch(
         const priced = grids.some((g) => g.d === d && g.cells.has(cellKey(outDate, retDate ?? "")));
         log(`${what.charAt(0).toUpperCase()}${what.slice(1)} didn't answer from every airport in time, so none of it is kept${priced ? "; the grid prices those dates" : ", and the grid has no price for those dates"}`, "info");
       }
-      if (pool.baseline != null && !ownUnanswered.size && !ownMissing.size) log(`Your own search comes to ${fmt(pool.baseline)}${combos.length > 1 ? ` at best, across ${combos.length} searches` : ""}`, "success");
+      if (pool.baseline != null && !ownUnanswered.size && !ownMissing.size) log(`Your own search comes to ${fmt(pool.baseline)}${combos.length > 1 ? ` at best, across ${combos.length} searches` : ""}${got.baseline?.provider ? `, from ${got.baseline.provider}` : ""}`, "success");
       const ins = withInsights()?.insights;
       if (ins?.level) log(`Prices for this trip are currently ${ins.level}`, "info");
       const asked = (codes: string[]) => [...new Set(codes.flatMap(airportsOf))].join("/");
@@ -670,7 +694,7 @@ export async function runSearch(
           const lookedUp = (
             await Promise.all(
               ask.look.map(async (l) => {
-                const hits = counted(await widening.must((signal) => backend.places(l.name, { signal, timeoutMs: 5_000 }), `places for ${l.name}`));
+                const hits = backend.places ? counted(await widening.must((co) => backend.places!(l.name, co), `places for ${l.name}`)) : null;
                 const hit = hits?.[0];
                 const code = hit ? (hit.kind === "airport" ? hit.code : (hit.airports[0]?.code ?? null)) : null;
                 if (!hit || !code || knownPlaces.has(code) || okFrom.has(code)) return null;
@@ -731,7 +755,8 @@ export async function runSearch(
     /* ---- The grid: the cheapest of every way to fly each pair of days ---- */
     // Built before widening to choose what to widen, and rebuilt after so bought fares take their cells. That includes open-jaw
     // fares, which no grid call returns.
-    let gridView: GridView | null = open || !flexible ? null : assembleGrid(plan, combos, grids, graphsOut, graphsBack, pool, usable);
+    // No grid at all when the provider has no calendars: bought fares alone would make a grid of one cell.
+    let gridView: GridView | null = open || !flexible || (!backend.dateGrid && !backend.priceGraph) ? null : assembleGrid(plan, combos, grids, graphsOut, graphsBack, pool, usable);
 
     /* ---- Stage 2: widen ---- */
     // Buys the most promising cells and hints, then waits for every job (early cell buys included) until widening stops.
@@ -750,8 +775,6 @@ export async function runSearch(
         const boughtAsked = (c: GridCell) => isAsked(c) && (c.via?.tickets === "two" || !ownUnanswered.has(c.via?.out ?? dests[0]));
         const cells = (gridView?.cells ?? []).filter((c) => c.price != null && !boughtAsked(c)).sort((a, b) => a.price! - b.price!);
         const worthIt: GridCell[] = cells.filter((c) => pool.baseline == null || c.price! < pool.baseline * 1.02).slice(0, CELLS_TO_PRICE);
-        // The cheapest cell to buy. The page quotes it, so it gets one more attempt than the rest.
-        const lead = worthIt[0] ?? null;
         if (plan.dates.prefer !== "none" && cells.length) {
           const nightsOf = (c: GridCell) => daysBetween(c.outDate, c.returnDate);
           const edge = plan.dates.prefer === "longest" ? Math.max(...cells.map(nightsOf)) : Math.min(...cells.map(nightsOf));
@@ -762,14 +785,13 @@ export async function runSearch(
         if (!retWin) for (const [, m] of graphsOut) for (const [day, price] of [...m].sort((a, b) => a[1] - b[1]).slice(0, 3)) if (day !== outDate) worthIt.push({ outDate: day, returnDate: day, price });
         // One-way calls are shared across cells, since an outbound is the same call whatever return it pairs with.
         const oneWayAsked = new Set<string>();
-        const oneWay = (leg: "out" | "back", a: string, b: string, day: string, shift: number, attempts = 2) => {
+        const oneWay = (leg: "out" | "back", a: string, b: string, day: string, shift: number) => {
           const k = `${leg}~${a}~${b}~${day}`;
           if (oneWayAsked.has(k)) return;
           oneWayAsked.add(k);
-          jobs.push(buyOneWay(leg, a, b, day, shift, attempts));
+          jobs.push(buyOneWay(leg, a, b, day, shift));
         };
         for (const c of worthIt) {
-          const attempts = c === lead ? 3 : 2;
           const key = cellKeyOf(c);
           if (hinted.has(key)) continue;
           hinted.add(key);
@@ -779,13 +801,13 @@ export async function runSearch(
           const back = c.via?.back ?? to;
           const fromQ = endpointOf(from);
           if (c.via?.tickets === "two" && ret) {
-            oneWay("out", fromQ, endpointOf(to), c.outDate, shift.out, attempts);
-            oneWay("back", endpointOf(back), fromQ, ret, shift.ret, attempts);
+            oneWay("out", fromQ, endpointOf(to), c.outDate, shift.out);
+            oneWay("back", endpointOf(back), fromQ, ret, shift.ret);
           } else {
             // On the asked dates, into one airport and from the first origin, these calls are the own search, so they count as it.
             const own = isAsked(c) && back === to && ownUnanswered.has(to);
             jobs.push(
-              buyCell(c, attempts).then((rs) => {
+              buyCell(c).then((rs) => {
                 if (!own || !ownUnanswered.has(to) || !rs.every(Boolean)) return;
                 ownUnanswered.delete(to);
                 noteBaseline(cheapestOf(rs), to);
@@ -929,14 +951,16 @@ export async function runSearch(
     // and leave the return to the booking page. Open-jaw fares are skipped.
     const returnsFor = new Map<number, IndexedItin>();
     const rtPicks = pickOutcome.picks.filter((p) => p.pair.out.rt && !p.pair.ret && !p.pair.out.jaw);
-    if (rtPicks.length) {
+    if (rtPicks.length && (backend.returns || fallback?.returns)) {
       log(`Finding the return flight${rtPicks.length === 1 ? "" : "s"} for ${rtPicks.length === 1 ? "that fare" : "those fares"}…`, "action");
-      // Returns stop at `RETURNS_WAIT_MS` or at their stage's stop, whichever comes first.
-      stopTimers.push(setTimeout(() => stops.returns.abort(), Math.floor(Math.min(RETURNS_WAIT_MS, deadlineMs / 4))));
-      // 12 s timeout, since a fare's first returns request can take ~9 s.
+      // Returns stop at `timing.returnsWaitMs` or at their stage's stop, whichever comes first.
+      stopTimers.push(setTimeout(() => stops.returns.abort(), Math.floor(Math.min(timing.returnsWaitMs, deadlineMs / 4))));
       const returnsOf = async (x: IndexedItin, back: string) => {
         const input = queryFor(req, x.itin.from, x.itin.to, x.itin.departure.slice(0, 10), back);
-        const payload = await returning.must((signal) => backend.returns(input, { segments: x.itin.segments }, { signal, hedgeMs: 1_200, timeoutMs: 12_000, attempts: 2 }), `returns for ${x.itin.airlineCode}`);
+        // A fare's flights home come from the provider that sold it.
+        const via = fallback && x.itin.provider === fallback.name ? fallback : backend;
+        if (!via.returns) return null;
+        const payload = await returning.must((co) => via.returns!(input, { segments: x.itin.segments }, co), `returns for ${x.itin.airlineCode}${via !== backend ? ` (${via.name})` : ""}`);
         return payload ? payload.itineraries.filter((it) => it.price != null) : null;
       };
       /** Fetches one fare's return, asking again if the first answer is empty or above the fare. */
@@ -1104,7 +1128,8 @@ export async function runSearch(
     hooks.phase("done");
     const durationMs = now() - t0;
     const missed = pricing.unanswered.length + widening.unanswered.length + returning.unanswered.length;
-    log(`Done in ${(durationMs / 1000).toFixed(1)}s · ${queries} calls · ${pool.size} itineraries${missed ? ` · ${missed} never answered` : ""}`, "success");
+    log(`Done in ${(durationMs / 1000).toFixed(1)}s · ${queries} calls · ${pool.size} itineraries${missed ? ` · ${missed} never answered` : ""}${fallbacks ? ` · ${fallbacks} answered by ${fallback!.name}` : ""}`, "success");
+    if (fallbacks) notes.push(`${fallbacks} lookup${fallbacks === 1 ? "" : "s"} answered by ${fallback!.name} when ${backend.name} didn't; its fares book on its own site`);
     if (incomplete) {
       const day = (g: Incomplete["dates"][number]) => `${g.outDate}${g.returnDate ? ` → ${g.returnDate}` : ""}${g.route ? ` (${g.route})` : ""}`;
       notes.push(`Left out because they didn't answer in time: ${[incomplete.dates.length && `the dates ${incomplete.dates.map(day).join(", ")}`, incomplete.grid && "part of the date grid", incomplete.other && `${incomplete.other} other lookup${incomplete.other === 1 ? "" : "s"}`].filter(Boolean).join("; ")}`);
@@ -1135,6 +1160,7 @@ export async function runSearch(
         tokensOut: usages.reduce((s, u) => s + (u?.out ?? 0), 0),
         costUsd: usages.every((u) => u?.costUsd == null) ? null : usages.reduce((s, u) => s + (u?.costUsd ?? 0), 0),
         missed,
+        ...(fallback ? { fallback: fallbacks } : {}),
       },
       unencoded,
     };

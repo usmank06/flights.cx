@@ -3,7 +3,7 @@ import type { SearchInput } from "@/lib/flights/types";
 import { AIRPORTS } from "@/lib/airports";
 import { money, shortDate } from "@/lib/format";
 import type { DestinationView, FlightPlan, GridView, PlanView, SearchRequest } from "@/lib/types";
-import { airportsOf, asker, resolveEndpoint, SHOPPING_TIMEOUT_MS, Unanswered, type Endpoint } from "./asking";
+import { airportsOf, asker, faresAsker, resolveEndpoint, Unanswered, type Endpoint } from "./asking";
 import { compactForLLM, daysBetween, describeInput, mapLimit, shiftDay, toSearchInput, type CompactRow, type IndexedItin, type PlannedQuery } from "./core";
 import { abroadOnly, destinationViews } from "./engine";
 import { buildGrid, cleanWindow, gridRoute, heldFares, withHeld } from "./grid";
@@ -37,6 +37,8 @@ function asTheSearchAsks(input: SearchInput, ends: Map<string, Endpoint>): Searc
 
 export async function runFollowUpQueries(opts: {
   backend: FlightBackend;
+  /** The fares-only provider asked when the live one never answers (lib/flights/provider.ts). */
+  fallback?: FlightBackend | null;
   req: SearchRequest;
   queries: PlannedQuery[];
   existing: CompactRow[];
@@ -47,6 +49,8 @@ export async function runFollowUpQueries(opts: {
   const { backend, req, existing, log } = opts;
   const queries = opts.queries.slice(0, MAX_FOLLOWUP_QUERIES);
   const asking = asker({ signal: opts.signal, log: (t) => log(t.trim()) });
+  const spare = opts.fallback ? asker({ signal: opts.signal, log: (t) => log(t.trim()), bestEffort: true }) : null;
+  const fares = faresAsker({ backend, fallback: opts.fallback, ask: asking, spare, log: (t) => log(t.trim()) });
   const seen = new Set(existing.map((r) => keyOf(r.fare === "round-trip", r.retDate, r.from, r.to, r.dep, r.arr, r.fn.join("|"), r.price)));
   let nextId = existing.reduce((m, r) => Math.max(m, r.id), -1) + 1;
   const nextQ = existing.reduce((m, r) => Math.max(m, r.q ?? 0), 999) + 1;
@@ -67,7 +71,7 @@ export async function runFollowUpQueries(opts: {
   const rows: CompactRow[] = [];
   await mapLimit(calls, 8, async ({ input, i }) => {
     const reason = queries[i].reason;
-    const payload = await asking.must((signal) => backend.shopping(input, { signal, hedgeMs: 2_000, timeoutMs: SHOPPING_TIMEOUT_MS, attempts: 2 }), `${describeInput(input)} — ${reason}`);
+    const payload = await fares(input, `${describeInput(input)} — ${reason}`);
     if (!payload) return;
     const rt = input.trip === "round-trip";
     const retDate = rt ? input.flights[1]?.date : undefined;
@@ -183,13 +187,13 @@ export async function runFollowUpViews(opts: {
   if (ask.explore) {
     const x = ask.explore;
     const origin = code(x.origin);
-    if (origin) {
+    if (origin && !backend.explore) out.summary.push("The list of places was not built: the flight provider has no Explore.");
+    else if (origin) {
       const asking = asker({ signal, log: (t) => log(t.trim()) });
       const found = await asking.must(
-        (s) =>
-          backend.explore(origin, {
-            signal: s,
-            timeoutMs: 8_000,
+        (o) =>
+          backend.explore!(origin, {
+            ...o,
             dates: isIso(x.out_date) ? { out: x.out_date, ret: isIso(x.ret_date) ? x.ret_date : null } : null,
             passengers: [Math.max(1, req.passengers.adults), req.passengers.children, req.passengers.infantsInSeat, req.passengers.infantsOnLap],
             seat: req.cabin,
