@@ -403,6 +403,8 @@ export type SearchRecord = {
   /** Null until the search has ended. */
   stats: SearchStats | null;
   error: string | null;
+  /** The failure came from the request (an unusable trip, past dates), so the page asks for a change instead of reporting an issue. */
+  errorTheirs?: boolean;
   followUps: FollowUp[];
   /** The itineraries the search found, compacted, which most follow-ups answer from without searching again. */
   session: SessionState | null;

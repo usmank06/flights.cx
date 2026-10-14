@@ -1,5 +1,6 @@
 import { after, type NextRequest } from "next/server";
 import { newOwnerKey, ownerKeyHash } from "@/lib/search/owner";
+import { ISSUE_MESSAGE } from "@/lib/search/plan";
 import { notJson } from "@/lib/abuse/json-only";
 import { rateLimit, tooMany } from "@/lib/abuse/limit";
 import { callerIp, REFUSED_SAID, SEARCH_ACTION, TOKEN_HEADER, verifyRecaptcha } from "@/lib/abuse/recaptcha";
@@ -81,7 +82,7 @@ export async function POST(req: NextRequest) {
     // The engine and the error write both failed. End the stream so the page doesn't wait out maxDuration.
     (e) => {
       void reportError("search", e, { where: "ended without a record", slug: record.slug });
-      send({ t: "error", message: "We couldn’t finish this search." });
+      send({ t: "error", message: ISSUE_MESSAGE });
       close();
     }
   );

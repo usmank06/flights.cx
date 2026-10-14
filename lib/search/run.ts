@@ -13,7 +13,7 @@ import { codeLine, runSearch, SearchFailure, toPlanView, type EngineDeps, type L
 import { liveJev } from "./jev";
 import { resolveModel } from "./models";
 import { answerAmounts, answerQuestion, mentionsMoney, moneyAllowed, plainAnswer, planAmounts, undash } from "./voice";
-import { planTrip, requestFromPlan, TravellerError } from "./plan";
+import { ISSUE_MESSAGE, planTrip, requestFromPlan, TravellerError } from "./plan";
 import { countLine, NO_TALLY, phaseSeen, type Tally } from "./tally";
 import { liveExploreAgent } from "./explore-agent";
 import { gridAround, runFollowUpQueries, runFollowUpViews } from "./followup";
@@ -226,15 +226,16 @@ export async function executeSearch(
   } catch (e) {
     const raw = (e as Error).message || "Search failed";
     // `error` is public. TravellerError messages are shown as is; others are logged and replaced with a generic message.
-    const message = e instanceof TravellerError ? raw : "Something went wrong on our side, so this search stopped. Search again to try it fresh.";
+    const message = e instanceof TravellerError ? raw : ISSUE_MESSAGE;
     await live.end();
     events.push({ seq: ++seq, at: at(), type: "error", message: raw });
     onProgress?.({ type: "log", text: message, kind: "error" });
     // Keep the planned trip if the search got that far, so the page shows what was searched and Edit starts from it.
     const ran = e instanceof SearchFailure ? { request: e.ran.request, plan: e.ran.plan } : {};
-    const failed = await s.update(record.slug, (r) => ({ ...r, ...ran, status: "error", phase: "error", mode: deps.backend.live ? "live" : "demo", error: message, events }));
+    const theirs = e instanceof TravellerError && e.theirs;
+    const failed = await s.update(record.slug, (r) => ({ ...r, ...ran, status: "error", phase: "error", mode: deps.backend.live ? "live" : "demo", error: message, errorTheirs: theirs, events }));
     // Report it unless the request itself caused it.
-    if (!(e instanceof TravellerError && e.theirs)) await reportError("search", e, { where: e instanceof TravellerError ? "ended for the traveller" : "threw", slug: record.slug });
+    if (!theirs) await reportError("search", e, { where: e instanceof TravellerError ? "ended for the traveller" : "threw", slug: record.slug });
     await recordMetric(
       searchEvent(
         "search_failed",
@@ -244,7 +245,7 @@ export async function executeSearch(
         { signedIn: Boolean(record.userId), detail: { message: raw.slice(0, 200) } }
       )
     );
-    return failed ?? { ...record, status: "error", phase: "error", error: message, events };
+    return failed ?? { ...record, status: "error", phase: "error", error: message, errorTheirs: theirs, events };
   }
 }
 

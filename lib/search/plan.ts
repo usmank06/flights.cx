@@ -439,6 +439,9 @@ export function placesIn(text: string): Place[] {
  * An error whose message is shown to the traveller as is; other errors get a generic message. `theirs` marks failures the request
  * itself caused (dates already passed, an unsearchable trip), which aren't reported as errors.
  */
+/** The message for a search stopped by a problem on our side. Every such failure is reported (run.ts), so "logged" is true. */
+export const ISSUE_MESSAGE = "Something on our side stopped this search before it finished. It’s been logged — try again in a little while.";
+
 export class TravellerError extends Error {
   constructor(
     message: string,

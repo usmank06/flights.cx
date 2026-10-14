@@ -32,7 +32,7 @@ import { metroCodes } from "./intake";
 import type { JevClient } from "./jev";
 import type { ModelOption } from "./models";
 import { DEFAULT_LABEL, hoursScore, pickPlans, type Pairing, type PickOutcome, type SlotPick } from "./pick";
-import { describesAPlace, requestFromPlan, TravellerError, type PlanOutcome, type TripPlan } from "./plan";
+import { describesAPlace, ISSUE_MESSAGE, requestFromPlan, TravellerError, type PlanOutcome, type TripPlan } from "./plan";
 import { tierWord, type ExploreAgent, type KnownPlace } from "./explore-agent";
 import { areaOf, gatewaysOf, inArea } from "./area";
 import { narrate } from "./voice";
@@ -268,7 +268,7 @@ export async function runSearch(
     log("Reading your trip…", "action");
     // Only the planner reads the trip. A failed plan gets one sampled retry, and a second failure ends the search. Timeouts
     // are 25 s, then 20 s, since a long request can take the planner up to 18 s.
-    if (!deps.planner) throw new TravellerError("Search isn't working right now. Try again in a moment.");
+    if (!deps.planner) throw new TravellerError(ISSUE_MESSAGE);
     const t = now();
     const attempt = async (again = false): Promise<PlanOutcome> => {
       try {
@@ -297,7 +297,7 @@ export async function runSearch(
     log(`Understood: ${plan.understood}`, "success");
     const failed = (message: string) => new SearchFailure(message, { request: req, plan: toPlanView(plan) });
     /** With nothing to show, an unanswered lookup means the search couldn't finish, not that there are no flights. */
-    const unfinished = () => (pricing.unanswered.length + widening.unanswered.length ? "We couldn't finish this search. Try it again in a moment." : null);
+    const unfinished = () => (pricing.unanswered.length + widening.unanswered.length ? ISSUE_MESSAGE : null);
     notes.push("Brief read by the planner");
 
     const origins = plan.origins.map((p) => p.code);
@@ -1050,7 +1050,7 @@ export async function runSearch(
     const ctx: BookingContext = { passengers: req.passengers, cabin: req.cabin, bags: req.bags, currency: req.currency, language: languageTag(req.locale) };
     let plans: FlightPlan[] = pickOutcome.picks.map((p, i) => planFrom(p, i, req, seats, ctx, outDate, retDate, returnsFor.get(p.pair.out.id)));
     plans = chosenPlaces ? noteRouteSwaps(plans, req) : dropPointless(keepCheapestCheapest(noteRouteSwaps(plans, req), plan), plan.picks);
-    if (!plans.length) throw failed("Something went wrong picking your flights. Try again in a moment.");
+    if (!plans.length) throw failed(ISSUE_MESSAGE);
 
     const best = Math.min(...plans.map((p) => p.price));
     // The page quotes the grid's cheapest days beside the plans. If they are well under every plan but had no flights, or came

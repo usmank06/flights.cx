@@ -266,8 +266,10 @@ export function SearchView({ initial, estimate = null }: { initial: SearchRecord
   const title = running
     ? "Finding the best way to fly it"
     : record.status === "error"
-      ? // Stopped early or found nothing bookable; the card below says which.
-        "No flights to show"
+      ? // Stopped by a problem on our side, or the request needs a change. The card below says which.
+        record.errorTheirs
+        ? "No flights to show"
+        : "We ran into an issue"
       : !n
         ? "No flights found"
         : n === 1
@@ -405,7 +407,7 @@ export function SearchView({ initial, estimate = null }: { initial: SearchRecord
               <section className="rise flex flex-col gap-4 rounded-[24px] bg-warn-soft px-5 py-5 sm:px-6">
                 <p className="flex items-start gap-2.5 text-[15px] leading-relaxed text-warn">
                   <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" strokeWidth={2.2} />
-                  {record.error ?? "Something went wrong on the way."}
+                  {record.error ?? "Something on our side stopped this search before it finished. It’s been logged — try again in a little while."}
                 </p>
                 <Freshness record={record} before={change} />
               </section>
