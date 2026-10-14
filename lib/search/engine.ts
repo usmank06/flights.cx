@@ -66,14 +66,16 @@ export type EngineDeps = {
 };
 /**
  * A search that read the trip but found nothing to show. It carries the request and plan, so the failed search can still
- * show its trip and Edit can start from it.
+ * show its trip and Edit can start from it. It counts as the traveller's (no flights on those dates, nothing priced there)
+ * unless `ours` is set, meaning something on our side stopped it. Then the page says so and the error log records it.
  */
 export class SearchFailure extends TravellerError {
   constructor(
     message: string,
-    readonly ran: { request: SearchRequest; plan: PlanView }
+    readonly ran: { request: SearchRequest; plan: PlanView },
+    ours = message === ISSUE_MESSAGE
   ) {
-    super(message);
+    super(message, !ours);
     this.name = "SearchFailure";
   }
 }
@@ -295,7 +297,7 @@ export async function runSearch(
     // Every query below uses the request as the planner read it.
     req = requestFromPlan(req, plan);
     log(`Understood: ${plan.understood}`, "success");
-    const failed = (message: string) => new SearchFailure(message, { request: req, plan: toPlanView(plan) });
+    const failed = (message: string, ours?: boolean) => new SearchFailure(message, { request: req, plan: toPlanView(plan) }, ours);
     /** With nothing to show, an unanswered lookup means the search couldn't finish, not that there are no flights. */
     const unfinished = () => (pricing.unanswered.length + widening.unanswered.length ? ISSUE_MESSAGE : null);
     notes.push("Brief read by the planner");
@@ -490,7 +492,7 @@ export async function runSearch(
     const area = open ? areaOf(plan.openHint) : null;
     if (open) {
       // An open search can't go on without Explore, since nothing else lists places.
-      if (!backend.explore) throw failed("Open destinations aren't available right now. Name a city and search again.");
+      if (!backend.explore) throw failed("Open destinations aren't available right now. Name a city and search again.", true);
       log(`Looking at where you could go from ${placeName(from)}${plan.dates.anchor.out ? " on those dates" : ""}…`, "action");
       const found = await pricing.must(
         (o) =>
